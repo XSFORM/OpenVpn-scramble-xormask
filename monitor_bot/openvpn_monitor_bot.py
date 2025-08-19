@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import subprocess
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import glob
 from OpenSSL import crypto
 
@@ -167,9 +167,107 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop('new_key_name', None)
         context.user_data.pop('new_key_expiry', None)
         return
+        
+async def universal_text_handler(update, context):
+    if context.user_data.get('await_key_name') or context.user_data.get('await_key_expiry'):
+        await create_key_handler(update, context)
+    elif context.user_data.get('await_renew_expiry'):
+        await renew_key_expiry_handler(update, context)
+    # ... возможно, еще другие случаи ...
 
-# ... (оставь остальные обработчики и main() как есть) ...
+async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys = get_ovpn_files()
+    if not keys:
+        await update.callback_query.edit_message_text("Нет ключей для обновления.", reply_markup=get_main_keyboard())
+        return
+    keyboard = []
+    for i, fname in enumerate(keys, 1):
+        keyboard.append([InlineKeyboardButton(f"{i}. {fname[:-5]}", callback_data=f"renew_{fname}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
+    await update.callback_query.edit_message_text(
+        "Выберите ключ для обновления:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    fname = query.data.split('_', 1)[1]
+    key_name = fname[:-5] if fname.endswith('.ovpn') else fname
+    context.user_data['renew_key_name'] = key_name
+    context.user_data['await_renew_expiry'] = True
+    await query.edit_message_text(
+        f"Введите сколько дней добавить к сроку действия ключа <b>{key_name}</b>:",
+        parse_mode="HTML"
+    )
 
+async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('await_renew_expiry'):
+        key_name = context.user_data['renew_key_name']
+        cert_path = f"{EASYRSA_DIR}/pki/issued/{key_name}.crt"
+        key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
+        req_path = f"{EASYRSA_DIR}/pki/reqs/{key_name}.req"
+        if not os.path.exists(cert_path):
+            await update.message.reply_text("Сертификат не найден для обновления!")
+            context.user_data.pop('renew_key_name', None)
+            context.user_data.pop('await_renew_expiry', None)
+            return
+
+        try:
+            days_to_add = int(update.message.text.strip())
+        except:
+            await update.message.reply_text("Некорректное число дней. Попробуйте ещё раз.")
+            return
+
+        # ...остальной код функции...
+
+        # 1. Получаем текущую дату окончания
+        with open(cert_path, "rb") as f:
+            cert_data = f.read()
+            cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
+            not_after = cert.get_notAfter().decode("ascii")
+            expiry_date = datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
+        
+        new_expiry_date = expiry_date + timedelta(days=days_to_add)
+        total_days = (new_expiry_date - datetime.utcnow()).days
+
+        # 2. Удаляем старый сертификат/ключ/req
+        for path in [cert_path, key_path, req_path]:
+            if os.path.exists(path):
+                os.remove(path)
+
+        # 3. Генерируем новый сертификат с новым сроком
+        try:
+            subprocess.run(
+                f"EASYRSA_CERT_EXPIRE={total_days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
+                shell=True, check=True, cwd=EASYRSA_DIR
+            )
+        except subprocess.CalledProcessError as e:
+            await update.message.reply_text(
+                f"Ошибка обновления сертификата: {e}", parse_mode="HTML"
+            )
+            context.user_data.pop('renew_key_name', None)
+            context.user_data.pop('await_renew_expiry', None)
+            return
+
+        # 4. Генерируем .ovpn
+        ovpn_path = generate_ovpn_for_client(key_name)
+
+        await update.message.reply_text(
+            f"Ключ <b>{key_name}</b> успешно обновлён!\nНовый срок действия: {total_days} дней.\nСохраняется в: {ovpn_path}",
+            parse_mode="HTML"
+        )
+
+        with open(ovpn_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f),
+                filename=f"{key_name}.ovpn"
+            )
+
+        context.user_data.pop('renew_key_name', None)
+        context.user_data.pop('await_renew_expiry', None)
+        return
+        
 def parse_openvpn_status(status_path=STATUS_LOG):
     clients = []
     online_names = set()
@@ -258,6 +356,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
         [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry')],
+        [InlineKeyboardButton("🔄 Обновить ключ", callback_data='renew_key')],
         [InlineKeyboardButton("✅ Включить клиента", callback_data='enable')],
         [InlineKeyboardButton("⚠️ Отключить клиента", callback_data='disable')],
         [InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
@@ -853,10 +952,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'refresh':
         clients, online_names, tunnel_ips = parse_openvpn_status()
-        msgs = split_message(format_clients(clients, online_names, tunnel_ips))
-        await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
-        for msg in msgs[1:]:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+        # остальной код
+    elif data == 'renew_key':
+        await renew_key_request(update, context)
+    elif data.startswith('renew_'):
+        await renew_key_select_handler(update, context)
+    # ... остальные elif ...
     elif data == 'stats':
         clients, online_names, tunnel_ips = parse_openvpn_status()
         message = format_all_keys_with_status(KEYS_DIR, online_names)
@@ -890,7 +991,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('key_'):
         idx = int(data.split('_')[1]) - 1
         keys = get_ovpn_files()
-        if 0 <= idx < len(keys):
+    if 0 <= idx < len(keys):
             await send_ovpn_file(update, context, keys[idx])
     elif data == 'delete_key':
         await delete_key_request(update, context)
@@ -949,11 +1050,11 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("online", online_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CallbackQueryHandler(restore_confirm_handler, pattern='^restore_confirm$'))
     app.add_handler(CallbackQueryHandler(restore_cancel_handler, pattern='^restore_cancel$'))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, create_key_handler))
     import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
