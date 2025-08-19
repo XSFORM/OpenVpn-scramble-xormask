@@ -2,6 +2,23 @@
 import os
 import subprocess
 from datetime import date, datetime
+import glob
+from OpenSSL import crypto
+
+def get_cert_expiry_info():
+    cert_dir = "/etc/openvpn/easy-rsa/pki/issued"
+    cert_files = glob.glob(f"{cert_dir}/*.crt")
+    result = []
+    for cert_file in cert_files:
+        client_name = os.path.basename(cert_file).replace(".crt", "")
+        with open(cert_file, "rb") as f:
+            cert_data = f.read()
+            cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
+            not_after = cert.get_notAfter().decode("ascii")
+            expiry_date = datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
+            days_left = (expiry_date - datetime.utcnow()).days
+            result.append((client_name, days_left, expiry_date))
+    return result
 import pytz
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -91,7 +108,7 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Этап: ждём имя
     if context.user_data.get('await_key_name'):
         key_name = update.message.text.strip()
-        ovpn_file = f"/root/{key_name}.ovpn"
+        ovpn_file = os.path.join(KEYS_DIR, f"{key_name}.ovpn")
         if os.path.exists(ovpn_file):
             await update.message.reply_text(
                 f"Клиент с именем <b>{key_name}</b> уже существует! Введите другое имя.",
@@ -117,11 +134,12 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         key_name = context.user_data['new_key_name']
 
-        # 1. Генерируем сертификат и ключ через EasyRSA
+        # Генерируем сертификат и ключ через EasyRSA
         try:
-            subprocess.run([
-                f"{EASYRSA_DIR}/easyrsa", '--batch', 'build-client-full', key_name, 'nopass'
-            ], check=True, cwd=EASYRSA_DIR)
+            subprocess.run(
+                f"EASYRSA_CERT_EXPIRE={days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
+                shell=True, check=True, cwd=EASYRSA_DIR
+            )
         except subprocess.CalledProcessError as e:
             await update.message.reply_text(
                 f"Ошибка генерации сертификата: {e}", parse_mode="HTML"
@@ -130,7 +148,7 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data.pop('new_key_expiry', None)
             return
 
-        # 2. Генерируем .ovpn
+        # Генерируем .ovpn
         ovpn_path = generate_ovpn_for_client(key_name)
 
         await update.message.reply_text(
@@ -138,7 +156,7 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML"
         )
 
-        # 3. Отправляем .ovpn
+        # Отправляем .ovpn
         with open(ovpn_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
@@ -239,6 +257,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("🔄 Обновить список", callback_data='refresh')],
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
+        [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry')],
         [InlineKeyboardButton("✅ Включить клиента", callback_data='enable')],
         [InlineKeyboardButton("⚠️ Отключить клиента", callback_data='disable')],
         [InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
@@ -462,6 +481,26 @@ async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
         else:
             await update.message.reply_text(msg, parse_mode="HTML")
+            
+async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys_info = get_cert_expiry_info()
+    text = "<b>Сроки действия клиентских ключей:</b>\n"
+    if not keys_info:
+        text += "Нет активных ключей."
+    else:
+        for client_name, days_left, expiry_date in sorted(keys_info):
+            if days_left < 0:
+                status = "❌ истёк"
+            elif days_left < 7:
+                status = f"⚠️ {days_left} дней"
+            else:
+                status = f"{days_left} дней"
+            text += f"• <b>{client_name}</b>: {status} (до {expiry_date.strftime('%Y-%m-%d')})\n"
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -663,22 +702,20 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         cert_path = f"{EASYRSA_DIR}/pki/issued/{key_name}.crt"
         key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
 
-        # Если сертификат уже есть, не генерируем заново
         if not (os.path.exists(cert_path) and os.path.exists(key_path)):
             try:
-                result = subprocess.run([
-                    f"{EASYRSA_DIR}/easyrsa", '--batch', 'build-client-full', key_name, 'nopass'
-                ], check=True, cwd=EASYRSA_DIR, capture_output=True, text=True)
+                subprocess.run(
+                    f"EASYRSA_CERT_EXPIRE={days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
+                    shell=True, check=True, cwd=EASYRSA_DIR
+                )
             except subprocess.CalledProcessError as e:
                 await update.message.reply_text(
-                    f"Ошибка генерации сертификата:\n{e.stderr or e.stdout or str(e)}",
-                    parse_mode="HTML"
+                    f"Ошибка генерации сертификата: {e}", parse_mode="HTML"
                 )
                 context.user_data.pop('new_key_name', None)
                 context.user_data.pop('new_key_expiry', None)
                 return
 
-        # Генерируем .ovpn
         ovpn_path = generate_ovpn_for_client(key_name)
 
         await update.message.reply_text(
@@ -691,25 +728,6 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=update.effective_chat.id,
                 document=InputFile(f),
                 filename=f"{key_name}.ovpn"
-            )
-
-        context.user_data.pop('new_key_name', None)
-        context.user_data.pop('new_key_expiry', None)
-        return
-
-        # Генерируем .ovpn для клиента
-        ovpn_path = generate_ovpn_for_client(client_name, output_dir=KEYS_DIR)
-
-        await update.message.reply_text(
-            f"Клиент <b>{client_name}</b> успешно создан!\nСрок действия: {days} дней.\nКонфиг сохранён в: {ovpn_path}",
-            parse_mode="HTML"
-        )
-        # Отправляем .ovpn файл
-        with open(ovpn_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=InputFile(f),
-                filename=f"{client_name}.ovpn"
             )
 
         context.user_data.pop('new_key_name', None)
@@ -852,6 +870,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for msg in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+    elif data == 'keys_expiry':
+            await view_keys_expiry_handler(update, context)
     elif data == 'help':
         msgs = split_message(HELP_TEXT)
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
