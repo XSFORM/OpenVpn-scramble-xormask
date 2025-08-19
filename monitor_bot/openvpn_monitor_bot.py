@@ -25,6 +25,133 @@ MGMT_SOCKET = "/var/run/openvpn.sock"
 
 clients_last_online = set()  # Для уведомлений
 
+# === Новый блок: генерация .ovpn ===
+def generate_ovpn_for_client(
+    client_name,
+    output_dir=KEYS_DIR,
+    template_path=f"{OPENVPN_DIR}/client-template.txt",
+    ca_path=f"{EASYRSA_DIR}/pki/ca.crt",
+    cert_path=None,
+    key_path=None,
+    tls_crypt_path=f"{OPENVPN_DIR}/tls-crypt.key",
+    tls_auth_path=f"{OPENVPN_DIR}/tls-auth.key",
+    server_conf_path=f"{OPENVPN_DIR}/server.conf"
+):
+    if cert_path is None:
+        cert_path = f"{EASYRSA_DIR}/pki/issued/{client_name}.crt"
+    if key_path is None:
+        key_path = f"{EASYRSA_DIR}/pki/private/{client_name}.key"
+
+    ovpn_file = os.path.join(output_dir, f"{client_name}.ovpn")
+
+    # Determine TLS_SIG (1=tls-crypt, 2=tls-auth)
+    TLS_SIG = None
+    if os.path.exists(server_conf_path):
+        with open(server_conf_path, "r") as f:
+            conf = f.read()
+            if "tls-crypt" in conf:
+                TLS_SIG = 1
+            elif "tls-auth" in conf:
+                TLS_SIG = 2
+
+    # Read all parts
+    with open(template_path, "r") as f:
+        template_content = f.read()
+    with open(ca_path, "r") as f:
+        ca_content = f.read()
+    with open(cert_path, "r") as f:
+        cert_content = f.read()
+    with open(key_path, "r") as f:
+        key_content = f.read()
+
+    ovpn_content = template_content + "\n"
+    ovpn_content += "<ca>\n" + ca_content + "\n</ca>\n"
+    ovpn_content += "<cert>\n" + cert_content + "\n</cert>\n"
+    ovpn_content += "<key>\n" + key_content + "\n</key>\n"
+
+    if TLS_SIG == 1 and os.path.exists(tls_crypt_path):
+        with open(tls_crypt_path, "r") as f:
+            tls_crypt_content = f.read()
+        ovpn_content += "<tls-crypt>\n" + tls_crypt_content + "\n</tls-crypt>\n"
+    elif TLS_SIG == 2 and os.path.exists(tls_auth_path):
+        ovpn_content += "key-direction 1\n"
+        with open(tls_auth_path, "r") as f:
+            tls_auth_content = f.read()
+        ovpn_content += "<tls-auth>\n" + tls_auth_content + "\n</tls-auth>\n"
+
+    with open(ovpn_file, "w") as f:
+        f.write(ovpn_content)
+    return ovpn_file
+# ==== Конец нового блока ====
+
+# ... (оставь все остальные функции без изменений) ...
+
+# === Измени только обработчик создания ключа ===
+async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Этап: ждём имя
+    if context.user_data.get('await_key_name'):
+        key_name = update.message.text.strip()
+        ovpn_file = f"/root/{key_name}.ovpn"
+        if os.path.exists(ovpn_file):
+            await update.message.reply_text(
+                f"Клиент с именем <b>{key_name}</b> уже существует! Введите другое имя.",
+                parse_mode="HTML"
+            )
+            return
+        context.user_data['new_key_name'] = key_name
+        context.user_data['await_key_name'] = False
+        context.user_data['await_key_expiry'] = True
+        await update.message.reply_text(
+            "Введите срок действия ключа в днях (по умолчанию 825):"
+        )
+        return
+
+    # Этап: ждём срок
+    if context.user_data.get('await_key_expiry'):
+        try:
+            days = int(update.message.text.strip())
+        except:
+            days = 825
+        context.user_data['new_key_expiry'] = days
+        context.user_data['await_key_expiry'] = False
+
+        key_name = context.user_data['new_key_name']
+
+        # 1. Генерируем сертификат и ключ через EasyRSA
+        try:
+            subprocess.run([
+                f"{EASYRSA_DIR}/easyrsa", '--batch', 'build-client-full', key_name, 'nopass'
+            ], check=True, cwd=EASYRSA_DIR)
+        except subprocess.CalledProcessError as e:
+            await update.message.reply_text(
+                f"Ошибка генерации сертификата: {e}", parse_mode="HTML"
+            )
+            context.user_data.pop('new_key_name', None)
+            context.user_data.pop('new_key_expiry', None)
+            return
+
+        # 2. Генерируем .ovpn
+        ovpn_path = generate_ovpn_for_client(key_name)
+
+        await update.message.reply_text(
+            f"Клиент <b>{key_name}</b> успешно создан!\nСрок действия: {days} дней.\nСохраняется в: {ovpn_path}",
+            parse_mode="HTML"
+        )
+
+        # 3. Отправляем .ovpn
+        with open(ovpn_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f),
+                filename=f"{key_name}.ovpn"
+            )
+
+        context.user_data.pop('new_key_name', None)
+        context.user_data.pop('new_key_expiry', None)
+        return
+
+# ... (оставь остальные обработчики и main() как есть) ...
+
 def parse_openvpn_status(status_path=STATUS_LOG):
     clients = []
     online_names = set()
@@ -117,6 +244,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
         [InlineKeyboardButton("📤 Отправить ключи", callback_data='send_keys')],
         [InlineKeyboardButton("🗑️ Удалить ключ", callback_data='delete_key')],
+        [InlineKeyboardButton("➕ Создать ключ", callback_data='create_key')],
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup')],
         [InlineKeyboardButton("🔄 Восстановить бэкап", callback_data='restore')],
         [InlineKeyboardButton("🔔 Уведомления", callback_data='notify')],
@@ -374,7 +502,6 @@ async def send_ovpn_file(update: Update, context: ContextTypes.DEFAULT_TYPE, fil
         )
 
 async def delete_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Показываем список ключей для удаления
     keys = get_ovpn_files()
     if not keys:
         await update.callback_query.edit_message_text("Нет ключей для удаления.", reply_markup=get_main_keyboard())
@@ -383,6 +510,12 @@ async def delete_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Выберите ключ для удаления:",
         reply_markup=get_delete_keys_keyboard(keys)
     )
+    
+async def ask_key_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        "Введите имя для нового клиента (например, vpnuser1):"
+    )
+    context.user_data['await_key_name'] = True
 
 async def delete_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -398,33 +531,25 @@ async def delete_key_confirm_handler(update: Update, context: ContextTypes.DEFAU
     fname = query.data.split('_', 2)[2]
     client_name = fname[:-5] if fname.endswith(".ovpn") else fname
 
-    # Удаление файлов .ovpn, сертификатов, ключей, CCD и revoke
     try:
-        # .ovpn
         ovpn_path = os.path.join(KEYS_DIR, fname)
         if os.path.exists(ovpn_path):
             os.remove(ovpn_path)
-        # issued crt
         crt_path = f"{EASYRSA_DIR}/pki/issued/{client_name}.crt"
         if os.path.exists(crt_path):
             os.remove(crt_path)
-        # private key
         key_path = f"{EASYRSA_DIR}/pki/private/{client_name}.key"
         if os.path.exists(key_path):
             os.remove(key_path)
-        # req
         req_path = f"{EASYRSA_DIR}/pki/reqs/{client_name}.req"
         if os.path.exists(req_path):
             os.remove(req_path)
-        # ccd
         ccd_path = os.path.join(CCD_DIR, client_name)
         if os.path.exists(ccd_path):
             os.remove(ccd_path)
-        # revoke и CRL
         revoke_cmd = f"cd {EASYRSA_DIR} && ./easyrsa revoke {client_name}"
         subprocess.run(revoke_cmd, shell=True)
         subprocess.run(f"cd {EASYRSA_DIR} && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl", shell=True)
-        # копируем CRL в openvpn
         crl_src = f"{EASYRSA_DIR}/pki/crl.pem"
         crl_dst = "/etc/openvpn/crl.pem"
         if os.path.exists(crl_src):
@@ -440,6 +565,146 @@ async def delete_key_cancel_handler(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.edit_message_text("Удаление отменено.", reply_markup=get_main_keyboard())
 
+def generate_ovpn_for_client(
+    client_name,
+    output_dir="/root",
+    template_path="/etc/openvpn/client-template.txt",
+    ca_path="/etc/openvpn/easy-rsa/pki/ca.crt",
+    cert_path=None,
+    key_path=None,
+    tls_crypt_path="/etc/openvpn/tls-crypt.key",
+    tls_auth_path="/etc/openvpn/tls-auth.key",
+    server_conf_path="/etc/openvpn/server.conf"
+):
+    if cert_path is None:
+        cert_path = f"/etc/openvpn/easy-rsa/pki/issued/{client_name}.crt"
+    if key_path is None:
+        key_path = f"/etc/openvpn/easy-rsa/pki/private/{client_name}.key"
+
+    ovpn_file = os.path.join(output_dir, f"{client_name}.ovpn")
+
+    TLS_SIG = None
+    if os.path.exists(server_conf_path):
+        with open(server_conf_path, "r") as f:
+            conf = f.read()
+            if "tls-crypt" in conf:
+                TLS_SIG = 1
+            elif "tls-auth" in conf:
+                TLS_SIG = 2
+
+    with open(template_path, "r") as f:
+        template_content = f.read()
+    with open(ca_path, "r") as f:
+        ca_content = f.read()
+    with open(cert_path, "r") as f:
+        cert_content = f.read()
+    with open(key_path, "r") as f:
+        key_content = f.read()
+
+    ovpn_content = template_content + "\n"
+    ovpn_content += "<ca>\n" + ca_content + "\n</ca>\n"
+    ovpn_content += "<cert>\n" + cert_content + "\n</cert>\n"
+    ovpn_content += "<key>\n" + key_content + "\n</key>\n"
+
+    if TLS_SIG == 1 and os.path.exists(tls_crypt_path):
+        with open(tls_crypt_path, "r") as f:
+            tls_crypt_content = f.read()
+        ovpn_content += "<tls-crypt>\n" + tls_crypt_content + "\n</tls-crypt>\n"
+    elif TLS_SIG == 2 and os.path.exists(tls_auth_path):
+        ovpn_content += "key-direction 1\n"
+        with open(tls_auth_path, "r") as f:
+            tls_auth_content = f.read()
+        ovpn_content += "<tls-auth>\n" + tls_auth_content + "\n</tls-auth>\n"
+
+    with open(ovpn_file, "w") as f:
+        f.write(ovpn_content)
+    return ovpn_file
+
+async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Этап: ждём имя
+    if context.user_data.get('await_key_name'):
+        key_name = update.message.text.strip()
+        ovpn_file = os.path.join(KEYS_DIR, f"{key_name}.ovpn")
+        if os.path.exists(ovpn_file):
+            await update.message.reply_text(
+                f"Клиент с именем <b>{key_name}</b> уже существует! Введите другое имя.",
+                parse_mode="HTML"
+            )
+            return
+        context.user_data['new_key_name'] = key_name
+        context.user_data['await_key_name'] = False
+        context.user_data['await_key_expiry'] = True
+        await update.message.reply_text(
+            "Введите срок действия ключа в днях (по умолчанию 825):"
+        )
+        return
+
+    # Этап: ждём срок
+    if context.user_data.get('await_key_expiry'):
+        try:
+            days = int(update.message.text.strip())
+        except:
+            days = 825
+        context.user_data['new_key_expiry'] = days
+        context.user_data['await_key_expiry'] = False
+
+        key_name = context.user_data['new_key_name']
+        cert_path = f"{EASYRSA_DIR}/pki/issued/{key_name}.crt"
+        key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
+
+        # Если сертификат уже есть, не генерируем заново
+        if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+            try:
+                result = subprocess.run([
+                    f"{EASYRSA_DIR}/easyrsa", '--batch', 'build-client-full', key_name, 'nopass'
+                ], check=True, cwd=EASYRSA_DIR, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                await update.message.reply_text(
+                    f"Ошибка генерации сертификата:\n{e.stderr or e.stdout or str(e)}",
+                    parse_mode="HTML"
+                )
+                context.user_data.pop('new_key_name', None)
+                context.user_data.pop('new_key_expiry', None)
+                return
+
+        # Генерируем .ovpn
+        ovpn_path = generate_ovpn_for_client(key_name)
+
+        await update.message.reply_text(
+            f"Клиент <b>{key_name}</b> успешно создан!\nСрок действия: {days} дней.\nСохраняется в: {ovpn_path}",
+            parse_mode="HTML"
+        )
+
+        with open(ovpn_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f),
+                filename=f"{key_name}.ovpn"
+            )
+
+        context.user_data.pop('new_key_name', None)
+        context.user_data.pop('new_key_expiry', None)
+        return
+
+        # Генерируем .ovpn для клиента
+        ovpn_path = generate_ovpn_for_client(client_name, output_dir=KEYS_DIR)
+
+        await update.message.reply_text(
+            f"Клиент <b>{client_name}</b> успешно создан!\nСрок действия: {days} дней.\nКонфиг сохранён в: {ovpn_path}",
+            parse_mode="HTML"
+        )
+        # Отправляем .ovpn файл
+        with open(ovpn_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=InputFile(f),
+                filename=f"{client_name}.ovpn"
+            )
+
+        context.user_data.pop('new_key_name', None)
+        context.user_data.pop('new_key_expiry', None)
+        return
+
 async def restore_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.edit_message_text(
@@ -453,7 +718,6 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if context.user_data.get('restore_wait_file'):
         file = update.message.document
-        # Добавлена проверка по имени файла!
         if file and (
             file.mime_type in ['application/gzip', 'application/x-gzip', 'application/x-tar', 'application/octet-stream']
             or file.file_name.endswith('.tar.gz') or file.file_name.endswith('.tgz') or file.file_name.endswith('.tar')
@@ -463,7 +727,6 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_path = f"/root/{file_name}"
             new_file = await context.bot.get_file(file_id)
             await new_file.download_to_drive(new_path)
-            context.user_data['restore_file_path'] = new_path
             context.user_data['restore_wait_file'] = False
 
             keyboard = InlineKeyboardMarkup([
@@ -606,6 +869,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_key_confirm_handler(update, context)
     elif data == 'cancel_delete':
         await delete_key_cancel_handler(update, context)
+    elif data == 'create_key':
+        await ask_key_name(update, context)
     elif data == 'backup':
         await send_backup(update, context)
     elif data == 'restore':
@@ -657,6 +922,7 @@ def main():
     app.add_handler(CallbackQueryHandler(restore_confirm_handler, pattern='^restore_confirm$'))
     app.add_handler(CallbackQueryHandler(restore_cancel_handler, pattern='^restore_cancel$'))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, create_key_handler))
     import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
