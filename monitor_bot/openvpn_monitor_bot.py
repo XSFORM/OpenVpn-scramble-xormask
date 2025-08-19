@@ -532,6 +532,24 @@ async def delete_key_confirm_handler(update: Update, context: ContextTypes.DEFAU
     client_name = fname[:-5] if fname.endswith(".ovpn") else fname
 
     try:
+        # 1. Завершить сессию клиента (management socket)
+        kill_openvpn_session(client_name)
+
+        # 2. Revoke сертификат
+        revoke_cmd = f"cd {EASYRSA_DIR} && ./easyrsa --batch revoke {client_name}"
+        subprocess.run(revoke_cmd, shell=True, check=True)
+
+        # 3. Сгенерировать новый CRL
+        subprocess.run(f"cd {EASYRSA_DIR} && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl", shell=True, check=True)
+
+        # 4. Скопировать CRL в openvpn
+        crl_src = f"{EASYRSA_DIR}/pki/crl.pem"
+        crl_dst = "/etc/openvpn/crl.pem"
+        if os.path.exists(crl_src):
+            subprocess.run(f"cp {crl_src} {crl_dst}", shell=True, check=True)
+            os.chmod(crl_dst, 0o644)
+
+        # 5. Удалить все файлы клиента
         ovpn_path = os.path.join(KEYS_DIR, fname)
         if os.path.exists(ovpn_path):
             os.remove(ovpn_path)
@@ -547,14 +565,7 @@ async def delete_key_confirm_handler(update: Update, context: ContextTypes.DEFAU
         ccd_path = os.path.join(CCD_DIR, client_name)
         if os.path.exists(ccd_path):
             os.remove(ccd_path)
-        revoke_cmd = f"cd {EASYRSA_DIR} && ./easyrsa revoke {client_name}"
-        subprocess.run(revoke_cmd, shell=True)
-        subprocess.run(f"cd {EASYRSA_DIR} && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl", shell=True)
-        crl_src = f"{EASYRSA_DIR}/pki/crl.pem"
-        crl_dst = "/etc/openvpn/crl.pem"
-        if os.path.exists(crl_src):
-            subprocess.run(f"cp {crl_src} {crl_dst}", shell=True)
-            os.chmod(crl_dst, 0o644)
+
     except Exception as e:
         await query.edit_message_text(f"Ошибка удаления ключа: {e}", reply_markup=get_main_keyboard())
         return
