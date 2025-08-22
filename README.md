@@ -1,4 +1,4 @@
-# OpenVpn-scramble-xormask
+# OpenVpnTLS2
 
 ## Быстрый старт: OpenVPN-сервер + Telegram-монитор-бот
 
