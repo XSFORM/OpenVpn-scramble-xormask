@@ -4,6 +4,34 @@ import subprocess
 from datetime import date, datetime, timedelta
 import glob
 from OpenSSL import crypto
+import pytz
+
+KEYS_DIR = "/root"
+OPENVPN_DIR = "/etc/openvpn"
+EASYRSA_DIR = "/etc/openvpn/easy-rsa"
+IPTABLES_DIR = "/etc/iptables"
+BACKUP_DIR = "/root"
+STATUS_LOG = "/var/log/openvpn/status.log"
+CCD_DIR = "/etc/openvpn/ccd"
+NOTIFY_FILE = "/root/monitor_bot/notify.flag"
+
+NOTIFY_DISCONNECT_FILE = "/root/monitor_bot/notify_disconnect.flag"   # <-- СЮДА
+
+def is_notify_disconnect_enabled():
+    return os.path.exists(NOTIFY_DISCONNECT_FILE)
+
+def set_notify_disconnect(flag):
+    if flag:
+        with open(NOTIFY_DISCONNECT_FILE, "w") as f:
+            f.write("on")
+    else:
+        if os.path.exists(NOTIFY_DISCONNECT_FILE):
+            os.remove(NOTIFY_DISCONNECT_FILE)
+
+TM_TZ = pytz.timezone("Asia/Ashgabat")
+MGMT_SOCKET = "/var/run/openvpn.sock"
+
+clients_last_online = set()  # Для уведомлений
 
 def get_cert_expiry_info():
     cert_dir = "/etc/openvpn/easy-rsa/pki/issued"
@@ -19,7 +47,18 @@ def get_cert_expiry_info():
             days_left = (expiry_date - datetime.utcnow()).days
             result.append((client_name, days_left, expiry_date))
     return result
-import pytz
+
+def format_all_keys_with_status(keys_dir, online_names):
+    files = [f for f in os.listdir(keys_dir) if f.endswith('.ovpn')]
+    result = "<b>Статус всех ключей:</b>\n\n"
+    for idx, f in enumerate(sorted(files), 1):
+        key_name = f[:-5]
+        status = "🟢" if key_name in online_names else "🔴"
+        result += f"{idx}. {status} <b>{key_name}</b>\n"
+    if not files:
+        result += "Нет ключей."
+    return result
+    
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 )
@@ -350,24 +389,33 @@ def format_tm_time(dt_str):
     except Exception:
         return dt_str
 
+def format_clients_names_only(clients):
+    result = "<b>Список клиентов:</b>\n\n"
+    for idx, c in enumerate(clients, 1):
+        result += f"{idx}. <b>{c['name']}</b>\n"
+    if not clients:
+        result += "Нет клиентов."
+    return result
+    
 def get_main_keyboard():
     keyboard = [
-        [InlineKeyboardButton("🔄 Обновить список", callback_data='refresh')],
+        [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
-        [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry')],
-        [InlineKeyboardButton("🔄 Обновить ключ", callback_data='renew_key')],
-        [InlineKeyboardButton("✅ Включить клиента", callback_data='enable')],
-        [InlineKeyboardButton("⚠️ Отключить клиента", callback_data='disable')],
-        [InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
-        [InlineKeyboardButton("📤 Отправить ключи", callback_data='send_keys')],
-        [InlineKeyboardButton("🗑️ Удалить ключ", callback_data='delete_key')],
-        [InlineKeyboardButton("➕ Создать ключ", callback_data='create_key')],
-        [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup')],
-        [InlineKeyboardButton("🔄 Восстановить бэкап", callback_data='restore')],
-        [InlineKeyboardButton("🔔 Уведомления", callback_data='notify')],
-        [InlineKeyboardButton("❓ Помощь", callback_data='help')],
-        [InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+        [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
+         InlineKeyboardButton("⌛ Обновить ключ", callback_data='renew_key')],
+        [InlineKeyboardButton("✅ Вкл.клиента", callback_data='enable'),
+         InlineKeyboardButton("⚠️ Откл.клиента", callback_data='disable')],
+        [InlineKeyboardButton("➕ Создать ключ", callback_data='create_key'),
+         InlineKeyboardButton("🗑️ Удалить ключ", callback_data='delete_key')],
+        [InlineKeyboardButton("📤 Отправить ключи", callback_data='send_keys'),
+         InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
+        [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
+         InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
+        [InlineKeyboardButton("🔔 Ключ подключился", callback_data='notify'),
+         InlineKeyboardButton("❌ Ключ отключился", callback_data='notify_disconnect')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help'),
+         InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -393,32 +441,53 @@ def get_confirm_delete_keyboard(fname):
     return InlineKeyboardMarkup(keyboard)
 
 HELP_TEXT = """
-<b>Доступные команды:</b>
-🔄 Обновить список — показать всех клиентов
-📊 Статистика — статус всех ключей (зелёный: онлайн, красный: оффлайн)
-🟢 Онлайн клиенты — только активные
-✅ Включить клиента — разблокировать ключ (через CCD)
-⚠️ Отключить клиента — заблокировать (через CCD) и отключить сессию
-📜 Просмотр лога — последние строки status.log
-📤 Отправить ключи — выбрать и получить .ovpn файл
-🗑️ Удалить ключ — выбрать и полностью удалить ключ
-📦 Бэкап OpenVPN — архивировать настройки и ключи
-🔄 Восстановить бэкап — восстановить из архива
-🔔 Уведомления — включить/выключить оповещения
-🏠 В главное меню — перейти к основному меню
+<b>🛡️ Доступные команды VPN Бота:</b>
+
+🔄 <b>Обновить список</b> — показать всех клиентов
+
+📊 <b>Статистика</b> — статус всех ключей (🟢 онлайн, 🔴 оффлайн)
+
+🟢 <b>Онлайн клиенты</b> — только активные подключения
+
+⏳ <b>Сроки ключей</b> — сколько дней осталось до истечения ключей
+
+⌛ <b>Обновить ключ</b> — увеличить срок действия выбранного ключа
+
+✅ <b>Включить клиента</b> — разблокировать ключ (через CCD)
+
+⚠️ <b>Отключить клиента</b> — заблокировать ключ (через CCD) и завершить сессию
+
+➕ <b>Создать ключ</b> — добавить нового клиента (.ovpn)
+
+🗑️ <b>Удалить ключ</b> — полностью удалить ключ и доступ клиента
+
+📤 <b>Отправить ключи</b> — получить .ovpn-файл для клиента
+
+📜 <b>Просмотр лога</b> — последние строки status.log
+
+📦 <b>Бэкап OpenVPN</b> — архивировать настройки и ключи
+
+🔁 <b>Восстановить бэкап</b> — восстановить систему из архива
+
+🔔 <b>Ключ подключился</b> — включить/выключить уведомления о подключениях
+
+❌ <b>Ключ отключился</b> — включить/выключить уведомления об отключениях
+
+❓ <b>Помощь</b> — показать это меню
+
+🏠 <b>В главное меню</b> — перейти к основному меню
+
+—
+💬 <b>По вопросам и поддержке:</b>
+<a href="https://t.me/XS_FORM">@XS_FORM</a>
 """
 
-def format_all_keys_with_status(keys_dir=KEYS_DIR, clients_online=set()):
-    files = [f for f in os.listdir(keys_dir) if f.endswith(".ovpn")]
-    result = "<b>Статус всех ключей:</b>\n\n"
-    for f in sorted(files):
+def format_all_ovpn_clients():
+    files = [f for f in os.listdir(KEYS_DIR) if f.endswith(".ovpn")]
+    result = "<b>Список клиентов:</b>\n\n"
+    for idx, f in enumerate(sorted(files), 1):
         key_name = f[:-5]
-        if key_name in clients_online and not is_client_ccd_disabled(key_name):
-            result += f"🟢 <b>{key_name}</b>\n"
-        elif is_client_ccd_disabled(key_name):
-            result += f"⛔ <b>{key_name}</b> (заблокирован через CCD)\n"
-        else:
-            result += f"🔴 <b>{key_name}</b>\n"
+        result += f"{idx}. <b>{key_name}</b>\n"
     if not files:
         result += "Нет ключей."
     return result
@@ -939,9 +1008,26 @@ async def check_new_connections(app: Application):
                     now_tm = datetime.now(pytz.utc).astimezone(TM_TZ).strftime("%Y-%m-%d %H:%M:%S")
                     msg += f"🟢 <b>{cname}</b> (<code>{tunnel_ip}</code>) — {now_tm}\n"
                 await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
+        if is_notify_disconnect_enabled():
+            disconnected_clients = clients_last_online - online_names
+            if disconnected_clients:
+                msg = "<b>Отключения:</b>\n\n"
+                for cname in disconnected_clients:
+                    now_tm = datetime.now(pytz.utc).astimezone(TM_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                    msg += f"🔴 <b>{cname}</b> — {now_tm}\n"
+                await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
         clients_last_online = set(online_names)
         await asyncio.sleep(10)
 
+async def notify_disconnect_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    enabled = is_notify_disconnect_enabled()
+    set_notify_disconnect(not enabled)
+    if not enabled:
+        await query.edit_message_text("✅ Уведомления об отключениях ВКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+    else:
+        await query.edit_message_text("🚫 Уведомления об отключениях ВЫКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+        
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
@@ -951,8 +1037,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == 'refresh':
-        clients, online_names, tunnel_ips = parse_openvpn_status()
-        # остальной код
+        clients, _, _ = parse_openvpn_status()
+        msg = format_clients_names_only(clients)
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
     elif data == 'renew_key':
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
@@ -972,7 +1059,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for msg in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
     elif data == 'keys_expiry':
-            await view_keys_expiry_handler(update, context)
+        await view_keys_expiry_handler(update, context)
     elif data == 'help':
         msgs = split_message(HELP_TEXT)
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
@@ -991,7 +1078,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('key_'):
         idx = int(data.split('_')[1]) - 1
         keys = get_ovpn_files()
-    if 0 <= idx < len(keys):
+        if 0 <= idx < len(keys):
             await send_ovpn_file(update, context, keys[idx])
     elif data == 'delete_key':
         await delete_key_request(update, context)
