@@ -47,6 +47,22 @@ def get_cert_expiry_info():
             days_left = (expiry_date - datetime.utcnow()).days
             result.append((client_name, days_left, expiry_date))
     return result
+    
+def format_clients_by_certs():
+    cert_dir = "/etc/openvpn/easy-rsa/pki/issued/"
+    certs = [f for f in os.listdir(cert_dir) if f.endswith(".crt")]
+    result = "<b>Список клиентов (по сертификатам):</b>\n\n"
+    idx = 1
+    for f in sorted(certs):
+        client_name = f[:-4]
+        # Игнорируем серверные сертификаты
+        if client_name.startswith("server_"):
+            continue
+        result += f"{idx}. <b>{client_name}</b>\n"
+        idx += 1
+    if idx == 1:
+        result += "Нет выданных сертификатов клиентов."
+    return result    
 
 def format_all_keys_with_status(keys_dir, online_names):
     files = [f for f in os.listdir(keys_dir) if f.endswith('.ovpn')]
@@ -642,13 +658,8 @@ async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Доступ запрещён.")
         return
-    clients, online_names, tunnel_ips = parse_openvpn_status()
-    msgs = split_message(format_clients(clients, online_names, tunnel_ips))
-    for i, msg in enumerate(msgs):
-        if i == 0:
-            await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
-        else:
-            await update.message.reply_text(msg, parse_mode="HTML")
+    msg = format_clients_by_certs()
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
             
 async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keys_info = get_cert_expiry_info()
@@ -1038,8 +1049,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == 'refresh':
-        clients, _, _ = parse_openvpn_status()
-        msg = format_clients_names_only(clients)
+        msg = format_clients_by_certs()
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
     elif data == 'renew_key':
         await renew_key_request(update, context)
