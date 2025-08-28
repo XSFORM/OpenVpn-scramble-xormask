@@ -63,6 +63,27 @@ def format_clients_by_certs():
     if idx == 1:
         result += "Нет выданных сертификатов клиентов."
     return result    
+    
+def format_all_keys_with_status_compact(keys_dir=KEYS_DIR, clients_online=set(), clients=[], tunnel_ips={}, ipp_map={}):
+    files = [f for f in os.listdir(keys_dir) if f.endswith(".ovpn")]
+    result = "<b>Статус всех ключей:</b>\n"
+    for idx, f in enumerate(sorted(files), 1):
+        key_name = f[:-5]
+        status = "🟢" if key_name in clients_online and not is_client_ccd_disabled(key_name) else "🔴"
+        if is_client_ccd_disabled(key_name):
+            status = "⛔"
+        # Тунельный IP: если онлайн, берем из tunnel_ips, если оффлайн — из ipp_map
+        tunnel_ip = tunnel_ips.get(key_name) or ipp_map.get(key_name, "Н/Д")
+        # Внешний IP: если онлайн — берем из clients, если оффлайн — "Н/Д"
+        client_info = next((c for c in clients if c['name'] == key_name), None)
+        if client_info and key_name in clients_online and not is_client_ccd_disabled(key_name):
+            real_ip = client_info.get('ip', 'Н/Д')
+        else:
+            real_ip = "Н/Д"
+        result += f"{idx}. | {status} | <b>{key_name}</b> | <code>{tunnel_ip}</code> | <code>{real_ip}</code>\n"
+    if not files:
+        result += "Нет ключей."
+    return result    
 
 def format_all_keys_with_status(keys_dir, online_names):
     files = [f for f in os.listdir(keys_dir) if f.endswith('.ovpn')]
@@ -376,6 +397,18 @@ def parse_openvpn_status(status_path=STATUS_LOG):
     except Exception as e:
         print(f"Ошибка чтения status.log: {e}")
     return clients, online_names, tunnel_ips
+    
+def read_ipp_file(ipp_file="/etc/openvpn/ipp.txt"):
+    ipp_map = {}
+    try:
+        with open(ipp_file, "r") as f:
+            for line in f:
+                if ',' in line:
+                    name, ip = line.strip().split(',', 1)
+                    ipp_map[name] = ip
+    except Exception:
+        pass
+    return ipp_map    
 
 def bytes_to_mb(b):
     try:
@@ -1049,16 +1082,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == 'refresh':
-<<<<<<< Updated upstream
         msg = format_clients_by_certs()
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
-=======
-        clients, online_names, tunnel_ips = parse_openvpn_status()
-        msgs = split_message(format_clients(clients, online_names, tunnel_ips))
-        await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
-        for msg in msgs[1:]:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
->>>>>>> Stashed changes
     elif data == 'renew_key':
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
@@ -1066,7 +1091,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ... остальные elif ...
     elif data == 'stats':
         clients, online_names, tunnel_ips = parse_openvpn_status()
-        message = format_all_keys_with_status(KEYS_DIR, online_names)
+        ipp_map = read_ipp_file("/etc/openvpn/ipp.txt")
+        message = format_all_keys_with_status_compact(KEYS_DIR, online_names, clients, tunnel_ips, ipp_map)
         msgs = split_message(message)
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for msg in msgs[1:]:
