@@ -1049,8 +1049,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == 'refresh':
+<<<<<<< Updated upstream
         msg = format_clients_by_certs()
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+=======
+        clients, online_names, tunnel_ips = parse_openvpn_status()
+        msgs = split_message(format_clients(clients, online_names, tunnel_ips))
+        await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
+        for msg in msgs[1:]:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+>>>>>>> Stashed changes
     elif data == 'renew_key':
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
@@ -1063,6 +1071,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for msg in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+    # ... и все остальные elif на одном уровне ...
     elif data == 'online':
         clients, online_names, tunnel_ips = parse_openvpn_status()
         msgs = split_message(format_online_clients(clients, online_names, tunnel_ips))
