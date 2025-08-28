@@ -925,6 +925,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_file = await context.bot.get_file(file_id)
             await new_file.download_to_drive(new_path)
             context.user_data['restore_wait_file'] = False
+            context.user_data['restore_file_path'] = new_path
 
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Да, восстановить", callback_data='restore_confirm')],
