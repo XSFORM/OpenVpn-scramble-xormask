@@ -34,8 +34,10 @@
 
 
 6. **запуск:**
+   ```bash
    bash openvpn-install.sh
-
+   ```
+   
 ---
 
 ## Управление OpenVPN
