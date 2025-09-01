@@ -1,11 +1,22 @@
 # -*- coding: utf-8 -*-
 import os
 import subprocess
+import time
 from datetime import date, datetime, timedelta
 import glob
 from OpenSSL import crypto
 import pytz
 
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+)
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+)
+
+from config import TOKEN, ADMIN_ID
+
+# --- Константы путей ---
 KEYS_DIR = "/root"
 OPENVPN_DIR = "/etc/openvpn"
 EASYRSA_DIR = "/etc/openvpn/easy-rsa"
@@ -13,28 +24,25 @@ IPTABLES_DIR = "/etc/iptables"
 BACKUP_DIR = "/root"
 STATUS_LOG = "/var/log/openvpn/status.log"
 CCD_DIR = "/etc/openvpn/ccd"
+
+# Файл-флаг для уведомлений о НОВЫХ подключениях (если оставляешь функционал)
 NOTIFY_FILE = "/root/monitor_bot/notify.flag"
-
-NOTIFY_DISCONNECT_FILE = "/root/monitor_bot/notify_disconnect.flag"   # <-- СЮДА
-
-def is_notify_disconnect_enabled():
-    return os.path.exists(NOTIFY_DISCONNECT_FILE)
-
-def set_notify_disconnect(flag):
-    if flag:
-        with open(NOTIFY_DISCONNECT_FILE, "w") as f:
-            f.write("on")
-    else:
-        if os.path.exists(NOTIFY_DISCONNECT_FILE):
-            os.remove(NOTIFY_DISCONNECT_FILE)
 
 TM_TZ = pytz.timezone("Asia/Ashgabat")
 MGMT_SOCKET = "/var/run/openvpn.sock"
 
-clients_last_online = set()  # Для уведомлений
+# --- Порог тревоги и антиспам ---
+MIN_ONLINE_ALERT = 15          # Если онлайн клиентов меньше этого числа — предупреждение
+ALERT_INTERVAL_SEC = 300       # Не слать тревогу чаще, чем раз в 5 минут
+last_alert_time = 0            # Время последней тревоги (epoch)
+
+# Для отслеживания подключений/отключений
+clients_last_online = set()
+
+# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 
 def get_cert_expiry_info():
-    cert_dir = "/etc/openvpn/easy-rsa/pki/issued"
+    cert_dir = f"{EASYRSA_DIR}/pki/issued"
     cert_files = glob.glob(f"{cert_dir}/*.crt")
     result = []
     for cert_file in cert_files:
@@ -47,23 +55,22 @@ def get_cert_expiry_info():
             days_left = (expiry_date - datetime.utcnow()).days
             result.append((client_name, days_left, expiry_date))
     return result
-    
+
 def format_clients_by_certs():
-    cert_dir = "/etc/openvpn/easy-rsa/pki/issued/"
+    cert_dir = f"{EASYRSA_DIR}/pki/issued/"
     certs = [f for f in os.listdir(cert_dir) if f.endswith(".crt")]
     result = "<b>Список клиентов (по сертификатам):</b>\n\n"
     idx = 1
     for f in sorted(certs):
         client_name = f[:-4]
-        # Игнорируем серверные сертификаты
         if client_name.startswith("server_"):
             continue
         result += f"{idx}. <b>{client_name}</b>\n"
         idx += 1
     if idx == 1:
         result += "Нет выданных сертификатов клиентов."
-    return result    
-    
+    return result
+
 def format_all_keys_with_status_compact(keys_dir=KEYS_DIR, clients_online=set(), clients=[], tunnel_ips={}, ipp_map={}):
     files = [f for f in os.listdir(keys_dir) if f.endswith(".ovpn")]
     result = "<b>Статус всех ключей:</b>\n"
@@ -72,9 +79,7 @@ def format_all_keys_with_status_compact(keys_dir=KEYS_DIR, clients_online=set(),
         status = "🟢" if key_name in clients_online and not is_client_ccd_disabled(key_name) else "🔴"
         if is_client_ccd_disabled(key_name):
             status = "⛔"
-        # Тунельный IP: если онлайн, берем из tunnel_ips, если оффлайн — из ipp_map
         tunnel_ip = tunnel_ips.get(key_name) or ipp_map.get(key_name, "Н/Д")
-        # Внешний IP: если онлайн — берем из clients, если оффлайн — "Н/Д"
         client_info = next((c for c in clients if c['name'] == key_name), None)
         if client_info and key_name in clients_online and not is_client_ccd_disabled(key_name):
             real_ip = client_info.get('ip', 'Н/Д')
@@ -83,267 +88,8 @@ def format_all_keys_with_status_compact(keys_dir=KEYS_DIR, clients_online=set(),
         result += f"{idx}. | {status} | <b>{key_name}</b> | <code>{tunnel_ip}</code> | <code>{real_ip}</code>\n"
     if not files:
         result += "Нет ключей."
-    return result    
-
-def format_all_keys_with_status(keys_dir, online_names):
-    files = [f for f in os.listdir(keys_dir) if f.endswith('.ovpn')]
-    result = "<b>Статус всех ключей:</b>\n\n"
-    for idx, f in enumerate(sorted(files), 1):
-        key_name = f[:-5]
-        status = "🟢" if key_name in online_names else "🔴"
-        result += f"{idx}. {status} <b>{key_name}</b>\n"
-    if not files:
-        result += "Нет ключей."
     return result
-    
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-)
 
-from config import TOKEN, ADMIN_ID
-
-KEYS_DIR = "/root"
-OPENVPN_DIR = "/etc/openvpn"
-EASYRSA_DIR = "/etc/openvpn/easy-rsa"
-IPTABLES_DIR = "/etc/iptables"
-BACKUP_DIR = "/root"
-STATUS_LOG = "/var/log/openvpn/status.log"
-CCD_DIR = "/etc/openvpn/ccd"
-NOTIFY_FILE = "/root/monitor_bot/notify.flag"
-TM_TZ = pytz.timezone("Asia/Ashgabat")
-MGMT_SOCKET = "/var/run/openvpn.sock"
-
-clients_last_online = set()  # Для уведомлений
-
-# === Новый блок: генерация .ovpn ===
-def generate_ovpn_for_client(
-    client_name,
-    output_dir=KEYS_DIR,
-    template_path=f"{OPENVPN_DIR}/client-template.txt",
-    ca_path=f"{EASYRSA_DIR}/pki/ca.crt",
-    cert_path=None,
-    key_path=None,
-    tls_crypt_path=f"{OPENVPN_DIR}/tls-crypt.key",
-    tls_auth_path=f"{OPENVPN_DIR}/tls-auth.key",
-    server_conf_path=f"{OPENVPN_DIR}/server.conf"
-):
-    if cert_path is None:
-        cert_path = f"{EASYRSA_DIR}/pki/issued/{client_name}.crt"
-    if key_path is None:
-        key_path = f"{EASYRSA_DIR}/pki/private/{client_name}.key"
-
-    ovpn_file = os.path.join(output_dir, f"{client_name}.ovpn")
-
-    # Determine TLS_SIG (1=tls-crypt, 2=tls-auth)
-    TLS_SIG = None
-    if os.path.exists(server_conf_path):
-        with open(server_conf_path, "r") as f:
-            conf = f.read()
-            if "tls-crypt" in conf:
-                TLS_SIG = 1
-            elif "tls-auth" in conf:
-                TLS_SIG = 2
-
-    # Read all parts
-    with open(template_path, "r") as f:
-        template_content = f.read()
-    with open(ca_path, "r") as f:
-        ca_content = f.read()
-    with open(cert_path, "r") as f:
-        cert_content = f.read()
-    with open(key_path, "r") as f:
-        key_content = f.read()
-
-    ovpn_content = template_content + "\n"
-    ovpn_content += "<ca>\n" + ca_content + "\n</ca>\n"
-    ovpn_content += "<cert>\n" + cert_content + "\n</cert>\n"
-    ovpn_content += "<key>\n" + key_content + "\n</key>\n"
-
-    if TLS_SIG == 1 and os.path.exists(tls_crypt_path):
-        with open(tls_crypt_path, "r") as f:
-            tls_crypt_content = f.read()
-        ovpn_content += "<tls-crypt>\n" + tls_crypt_content + "\n</tls-crypt>\n"
-    elif TLS_SIG == 2 and os.path.exists(tls_auth_path):
-        ovpn_content += "key-direction 1\n"
-        with open(tls_auth_path, "r") as f:
-            tls_auth_content = f.read()
-        ovpn_content += "<tls-auth>\n" + tls_auth_content + "\n</tls-auth>\n"
-
-    with open(ovpn_file, "w") as f:
-        f.write(ovpn_content)
-    return ovpn_file
-# ==== Конец нового блока ====
-
-# ... (оставь все остальные функции без изменений) ...
-
-# === Измени только обработчик создания ключа ===
-async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Этап: ждём имя
-    if context.user_data.get('await_key_name'):
-        key_name = update.message.text.strip()
-        ovpn_file = os.path.join(KEYS_DIR, f"{key_name}.ovpn")
-        if os.path.exists(ovpn_file):
-            await update.message.reply_text(
-                f"Клиент с именем <b>{key_name}</b> уже существует! Введите другое имя.",
-                parse_mode="HTML"
-            )
-            return
-        context.user_data['new_key_name'] = key_name
-        context.user_data['await_key_name'] = False
-        context.user_data['await_key_expiry'] = True
-        await update.message.reply_text(
-            "Введите срок действия ключа в днях (по умолчанию 825):"
-        )
-        return
-
-    # Этап: ждём срок
-    if context.user_data.get('await_key_expiry'):
-        try:
-            days = int(update.message.text.strip())
-        except:
-            days = 825
-        context.user_data['new_key_expiry'] = days
-        context.user_data['await_key_expiry'] = False
-
-        key_name = context.user_data['new_key_name']
-
-        # Генерируем сертификат и ключ через EasyRSA
-        try:
-            subprocess.run(
-                f"EASYRSA_CERT_EXPIRE={days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
-                shell=True, check=True, cwd=EASYRSA_DIR
-            )
-        except subprocess.CalledProcessError as e:
-            await update.message.reply_text(
-                f"Ошибка генерации сертификата: {e}", parse_mode="HTML"
-            )
-            context.user_data.pop('new_key_name', None)
-            context.user_data.pop('new_key_expiry', None)
-            return
-
-        # Генерируем .ovpn
-        ovpn_path = generate_ovpn_for_client(key_name)
-
-        await update.message.reply_text(
-            f"Клиент <b>{key_name}</b> успешно создан!\nСрок действия: {days} дней.\nСохраняется в: {ovpn_path}",
-            parse_mode="HTML"
-        )
-
-        # Отправляем .ovpn
-        with open(ovpn_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=InputFile(f),
-                filename=f"{key_name}.ovpn"
-            )
-
-        context.user_data.pop('new_key_name', None)
-        context.user_data.pop('new_key_expiry', None)
-        return
-        
-async def universal_text_handler(update, context):
-    if context.user_data.get('await_key_name') or context.user_data.get('await_key_expiry'):
-        await create_key_handler(update, context)
-    elif context.user_data.get('await_renew_expiry'):
-        await renew_key_expiry_handler(update, context)
-    # ... возможно, еще другие случаи ...
-
-async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keys = get_ovpn_files()
-    if not keys:
-        await update.callback_query.edit_message_text("Нет ключей для обновления.", reply_markup=get_main_keyboard())
-        return
-    keyboard = []
-    for i, fname in enumerate(keys, 1):
-        keyboard.append([InlineKeyboardButton(f"{i}. {fname[:-5]}", callback_data=f"renew_{fname}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
-    await update.callback_query.edit_message_text(
-        "Выберите ключ для обновления:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    
-async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    fname = query.data.split('_', 1)[1]
-    key_name = fname[:-5] if fname.endswith('.ovpn') else fname
-    context.user_data['renew_key_name'] = key_name
-    context.user_data['await_renew_expiry'] = True
-    await query.edit_message_text(
-        f"Введите сколько дней добавить к сроку действия ключа <b>{key_name}</b>:",
-        parse_mode="HTML"
-    )
-
-async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('await_renew_expiry'):
-        key_name = context.user_data['renew_key_name']
-        cert_path = f"{EASYRSA_DIR}/pki/issued/{key_name}.crt"
-        key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
-        req_path = f"{EASYRSA_DIR}/pki/reqs/{key_name}.req"
-        if not os.path.exists(cert_path):
-            await update.message.reply_text("Сертификат не найден для обновления!")
-            context.user_data.pop('renew_key_name', None)
-            context.user_data.pop('await_renew_expiry', None)
-            return
-
-        try:
-            days_to_add = int(update.message.text.strip())
-        except:
-            await update.message.reply_text("Некорректное число дней. Попробуйте ещё раз.")
-            return
-
-        # ...остальной код функции...
-
-        # 1. Получаем текущую дату окончания
-        with open(cert_path, "rb") as f:
-            cert_data = f.read()
-            cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
-            not_after = cert.get_notAfter().decode("ascii")
-            expiry_date = datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
-        
-        new_expiry_date = expiry_date + timedelta(days=days_to_add)
-        total_days = (new_expiry_date - datetime.utcnow()).days
-
-        # 2. Удаляем старый сертификат/ключ/req
-        for path in [cert_path, key_path, req_path]:
-            if os.path.exists(path):
-                os.remove(path)
-
-        # 3. Генерируем новый сертификат с новым сроком
-        try:
-            subprocess.run(
-                f"EASYRSA_CERT_EXPIRE={total_days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
-                shell=True, check=True, cwd=EASYRSA_DIR
-            )
-        except subprocess.CalledProcessError as e:
-            await update.message.reply_text(
-                f"Ошибка обновления сертификата: {e}", parse_mode="HTML"
-            )
-            context.user_data.pop('renew_key_name', None)
-            context.user_data.pop('await_renew_expiry', None)
-            return
-
-        # 4. Генерируем .ovpn
-        ovpn_path = generate_ovpn_for_client(key_name)
-
-        await update.message.reply_text(
-            f"Ключ <b>{key_name}</b> успешно обновлён!\nНовый срок действия: {total_days} дней.\nСохраняется в: {ovpn_path}",
-            parse_mode="HTML"
-        )
-
-        with open(ovpn_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=InputFile(f),
-                filename=f"{key_name}.ovpn"
-            )
-
-        context.user_data.pop('renew_key_name', None)
-        context.user_data.pop('await_renew_expiry', None)
-        return
-        
 def parse_openvpn_status(status_path=STATUS_LOG):
     clients = []
     online_names = set()
@@ -395,9 +141,9 @@ def parse_openvpn_status(status_path=STATUS_LOG):
                     tunnel_ips[cname] = tunnel_ip
                     online_names.add(cname)
     except Exception as e:
-        print(f"Ошибка чтения status.log: {e}")
+        print(f"[parse_openvpn_status] Ошибка чтения status.log: {e}")
     return clients, online_names, tunnel_ips
-    
+
 def read_ipp_file(ipp_file="/etc/openvpn/ipp.txt"):
     ipp_map = {}
     try:
@@ -408,7 +154,7 @@ def read_ipp_file(ipp_file="/etc/openvpn/ipp.txt"):
                     ipp_map[name] = ip
     except Exception:
         pass
-    return ipp_map    
+    return ipp_map
 
 def bytes_to_mb(b):
     try:
@@ -437,152 +183,6 @@ def format_tm_time(dt_str):
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return dt_str
-
-def format_clients_names_only(clients):
-    result = "<b>Список клиентов:</b>\n\n"
-    for idx, c in enumerate(clients, 1):
-        result += f"{idx}. <b>{c['name']}</b>\n"
-    if not clients:
-        result += "Нет клиентов."
-    return result
-    
-def get_main_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
-         InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
-        [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
-         InlineKeyboardButton("⌛ Обновить ключ", callback_data='renew_key')],
-        [InlineKeyboardButton("✅ Вкл.клиента", callback_data='enable'),
-         InlineKeyboardButton("⚠️ Откл.клиента", callback_data='disable')],
-        [InlineKeyboardButton("➕ Создать ключ", callback_data='create_key'),
-         InlineKeyboardButton("🗑️ Удалить ключ", callback_data='delete_key')],
-        [InlineKeyboardButton("📤 Отправить ключи", callback_data='send_keys'),
-         InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
-        [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
-         InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
-        [InlineKeyboardButton("🔔 Ключ подключился", callback_data='notify'),
-         InlineKeyboardButton("❌ Ключ отключился", callback_data='notify_disconnect')],
-        [InlineKeyboardButton("❓ Помощь", callback_data='help'),
-         InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_keys_keyboard(keys):
-    keyboard = []
-    for i, fname in enumerate(keys, 1):
-        keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"key_{i}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
-    return InlineKeyboardMarkup(keyboard)
-
-def get_delete_keys_keyboard(keys):
-    keyboard = []
-    for i, fname in enumerate(keys, 1):
-        keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"delete_{fname}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
-    return InlineKeyboardMarkup(keyboard)
-
-def get_confirm_delete_keyboard(fname):
-    keyboard = [
-        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{fname}")],
-        [InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_delete")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-HELP_TEXT = """
-<b>🛡️ Доступные команды VPN Бота:</b>
-
-🔄 <b>Обновить список</b> — показать всех клиентов
-
-📊 <b>Статистика</b> — статус всех ключей (🟢 онлайн, 🔴 оффлайн)
-
-🟢 <b>Онлайн клиенты</b> — только активные подключения
-
-⏳ <b>Сроки ключей</b> — сколько дней осталось до истечения ключей
-
-⌛ <b>Обновить ключ</b> — увеличить срок действия выбранного ключа
-
-✅ <b>Включить клиента</b> — разблокировать ключ (через CCD)
-
-⚠️ <b>Отключить клиента</b> — заблокировать ключ (через CCD) и завершить сессию
-
-➕ <b>Создать ключ</b> — добавить нового клиента (.ovpn)
-
-🗑️ <b>Удалить ключ</b> — полностью удалить ключ и доступ клиента
-
-📤 <b>Отправить ключи</b> — получить .ovpn-файл для клиента
-
-📜 <b>Просмотр лога</b> — последние строки status.log
-
-📦 <b>Бэкап OpenVPN</b> — архивировать настройки и ключи
-
-🔁 <b>Восстановить бэкап</b> — восстановить систему из архива
-
-🔔 <b>Ключ подключился</b> — включить/выключить уведомления о подключениях
-
-❌ <b>Ключ отключился</b> — включить/выключить уведомления об отключениях
-
-❓ <b>Помощь</b> — показать это меню
-
-🏠 <b>В главное меню</b> — перейти к основному меню
-
-—
-💬 <b>По вопросам и поддержке:</b>
-<a href="https://t.me/XS_FORM">@XS_FORM</a>
-"""
-
-def format_all_ovpn_clients():
-    files = [f for f in os.listdir(KEYS_DIR) if f.endswith(".ovpn")]
-    result = "<b>Список клиентов:</b>\n\n"
-    for idx, f in enumerate(sorted(files), 1):
-        key_name = f[:-5]
-        result += f"{idx}. <b>{key_name}</b>\n"
-    if not files:
-        result += "Нет ключей."
-    return result
-
-def format_clients(clients, online_names, tunnel_ips):
-    result = "<b>Список клиентов (только сессии):</b>\n\n"
-    for c in clients:
-        if is_client_ccd_disabled(c['name']):
-            status_circle = "⛔"
-        else:
-            status_circle = "🟢" if c['name'] in online_names else "🔴"
-        tunnel_ip = tunnel_ips.get(c['name'], 'нет данных')
-        result += (
-            f"{status_circle} <b>{c['name']}</b>\n"
-            f"🌐 <code>{c.get('ip', 'нет данных')}</code>\n"
-            f"🛡️ <b>Tunnel IP:</b> <code>{tunnel_ip}</code>\n"
-            f"🔌 <b>Порт:</b> <code>{c.get('port', '')}</code>\n"
-            f"📥 <b>Получено:</b> <code>{bytes_to_mb(c.get('bytes_recv', 0))}</code>\n"
-            f"📤 <b>Отправлено:</b> <code>{bytes_to_mb(c.get('bytes_sent', 0))}</code>\n"
-            f"🕒 <b>Сессия с:</b> <code>{format_tm_time(c.get('connected_since', ''))}</code>\n"
-            + "-"*15 + "\n"
-        )
-    if not clients:
-        result += "Нет клиентов."
-    return result
-
-def format_online_clients(clients, online_names, tunnel_ips):
-    result = "<b>Онлайн клиенты:</b>\n\n"
-    count = 0
-    for c in clients:
-        if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
-            count += 1
-            tunnel_ip = tunnel_ips.get(c['name'], 'нет данных')
-            result += (
-                f"🟢 <b>{c['name']}</b>\n"
-                f"🌐 <code>{c.get('ip', 'нет данных')}</code>\n"
-                f"🛡️ <b>Tunnel IP:</b> <code>{tunnel_ip}</code>\n"
-                f"🔌 <b>Порт:</b> <code>{c.get('port', '')}</code>\n"
-                f"📥 <b>Получено:</b> <code>{bytes_to_mb(c.get('bytes_recv', 0))}</code>\n"
-                f"📤 <b>Отправлено:</b> <code>{bytes_to_mb(c.get('bytes_sent', 0))}</code>\n"
-                f"🕒 <b>Сессия с:</b> <code>{format_tm_time(c.get('connected_since', ''))}</code>\n"
-                + "-"*15 + "\n"
-            )
-    if count == 0:
-        result += "Нет активных клиентов."
-    return result
 
 def get_ovpn_files():
     return [f for f in os.listdir(KEYS_DIR) if f.endswith(".ovpn")]
@@ -614,234 +214,103 @@ def kill_openvpn_session(client_name):
             subprocess.run(f'echo "kill {client_name}" | nc -U {MGMT_SOCKET}', shell=True)
             return True
         except Exception as e:
-            print(f"Ошибка отключения клиента через management socket: {e}")
+            print(f"[kill_openvpn_session] Ошибка: {e}")
     return False
 
-def show_enable_keyboard(all_keys):
-    result = []
-    for fname in sorted(all_keys):
-        cname = fname[:-5]
-        if is_client_ccd_disabled(cname):
-            result.append([InlineKeyboardButton(f"✅ Включить {cname}", callback_data=f"enable_{cname}")])
-    if not result:
-        result.append([InlineKeyboardButton("Нет заблокированных клиентов", callback_data='home')])
-    result.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
-    return InlineKeyboardMarkup(result)
+# ================== UI (Клавиатуры / HELP) ==================
 
-def show_disable_keyboard(all_keys):
-    result = []
-    for fname in sorted(all_keys):
-        cname = fname[:-5]
-        if not is_client_ccd_disabled(cname):
-            result.append([InlineKeyboardButton(f"⚠️ Отключить {cname}", callback_data=f"disable_{cname}")])
-    if not result:
-        result.append([InlineKeyboardButton("Нет клиентов для отключения", callback_data='home')])
-    result.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
-    return InlineKeyboardMarkup(result)
+def get_main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
+         InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
+        [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
+         InlineKeyboardButton("⌛ Обновить ключ", callback_data='renew_key')],
+        [InlineKeyboardButton("✅ Вкл.клиента", callback_data='enable'),
+         InlineKeyboardButton("⚠️ Откл.клиента", callback_data='disable')],
+        [InlineKeyboardButton("➕ Создать ключ", callback_data='create_key'),
+         InlineKeyboardButton("🗑️ Удалить ключ", callback_data='delete_key')],
+        [InlineKeyboardButton("📤 Отправить ключи", callback_data='send_keys'),
+         InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
+        [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
+         InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
+        [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help'),
+         InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-async def enable_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    all_keys = get_ovpn_files()
-    await query.edit_message_text(
-        "Выбери клиента для включения (разблокировки через CCD):",
-        reply_markup=show_enable_keyboard(all_keys)
-    )
+def get_keys_keyboard(keys):
+    keyboard = []
+    for i, fname in enumerate(keys, 1):
+        keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"key_{i}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
+    return InlineKeyboardMarkup(keyboard)
 
-async def disable_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    all_keys = get_ovpn_files()
-    await query.edit_message_text(
-        "Выбери клиента для отключения (блокировки через CCD):",
-        reply_markup=show_disable_keyboard(all_keys)
-    )
+def get_delete_keys_keyboard(keys):
+    keyboard = []
+    for i, fname in enumerate(keys, 1):
+        keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"delete_{fname}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
+    return InlineKeyboardMarkup(keyboard)
 
-async def enable_client_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    cname = query.data.split('_', 1)[1]
-    unblock_client_ccd(cname)
-    await query.edit_message_text(f"Клиент <b>{cname}</b> включён (разблокирован через CCD).", parse_mode="HTML", reply_markup=get_main_keyboard())
+def get_confirm_delete_keyboard(fname):
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{fname}")],
+        [InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_delete")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-async def disable_client_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    cname = query.data.split('_', 1)[1]
-    block_client_ccd(cname)
-    killed = kill_openvpn_session(cname)
-    msg = f"Клиент <b>{cname}</b> отключён (заблокирован через CCD)."
-    if killed:
-        msg += "\nСессия принудительно завершена."
-    else:
-        msg += "\nЕсли сессия была активна — она завершится при переподключении."
-    await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+HELP_TEXT = """
+<b>📖 Помощь по VPN Боту:</b>
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    await update.message.reply_text("Добро пожаловать в VPN бот!", reply_markup=get_main_keyboard())
+Этот бот управляет OpenVPN сервером и ключами через Telegram.
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+<b>Основные возможности:</b>
+• <b>Статистика и онлайн-клиенты</b> — мониторинг подключений.
+• <b>Создание, обновление, удаление ключей</b> — быстрое управление доступом.
+• <b>Резервное копирование и восстановление</b> — защита конфигурации и ключей.
+• <b>Тревога блокировки</b> — уведомления при массовых отключениях (блокировка IP).
 
-async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    msg = format_clients_by_certs()
-    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
-            
-async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keys_info = get_cert_expiry_info()
-    text = "<b>Сроки действия клиентских ключей:</b>\n"
-    if not keys_info:
-        text += "Нет активных ключей."
-    else:
-        for client_name, days_left, expiry_date in sorted(keys_info):
-            if days_left < 0:
-                status = "❌ истёк"
-            elif days_left < 7:
-                status = f"⚠️ {days_left} дней"
-            else:
-                status = f"{days_left} дней"
-            text += f"• <b>{client_name}</b>: {status} (до {expiry_date.strftime('%Y-%m-%d')})\n"
+<b>Типичные команды:</b>
+🔄 — показать список всех клиентов
+📊 — подробный статус всех ключей (кто онлайн, кто оффлайн)
+🟢 — только активные подключения
+⏳ — сколько дней осталось до истечения ключей
+➕ — создать новый VPN ключ (.ovpn)
+🗑️ — полностью удалить ключ и доступ
+✅/⚠️ — включить/отключить клиента (через CCD)
+📤 — получить .ovpn-файл в чат
+📦/🔄 — создать и восстановить бэкап всех настроек
+🚨 — включена тревога: если онлайн-клиентов станет слишком мало, придёт уведомление
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
-    else:
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
+<b>Вопросы или проблемы?</b>
+Напиши <a href="https://t.me/XS_FORM">@XS_FORM</a> или используй /help для повторной справки.
 
-async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    clients, online_names, tunnel_ips = parse_openvpn_status()
-    msgs = split_message(format_online_clients(clients, online_names, tunnel_ips))
-    for i, msg in enumerate(msgs):
-        if i == 0:
-            await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
-        else:
-            await update.message.reply_text(msg, parse_mode="HTML")
+<b>Безопасность:</b>
+• Все команды доступны только администратору.
+• Ваши ключи и логи не выходят за пределы сервера.
 
-async def send_keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    keys = get_ovpn_files()
-    await update.message.reply_text("Выберите номер ключа для отправки:", reply_markup=get_keys_keyboard(keys))
+<b>Удачного VPN!</b>
+"""
 
-async def send_ovpn_file(update: Update, context: ContextTypes.DEFAULT_TYPE, filename):
-    file_path = os.path.join(KEYS_DIR, filename)
-    if not os.path.exists(file_path):
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                f"Файл {filename} не найден в {KEYS_DIR}!", reply_markup=get_main_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                f"Файл {filename} не найден в {KEYS_DIR}!", reply_markup=get_main_keyboard()
-            )
-        return
-    with open(file_path, "rb") as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=InputFile(f),
-            filename=filename
-        )
-
-async def delete_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keys = get_ovpn_files()
-    if not keys:
-        await update.callback_query.edit_message_text("Нет ключей для удаления.", reply_markup=get_main_keyboard())
-        return
-    await update.callback_query.edit_message_text(
-        "Выберите ключ для удаления:",
-        reply_markup=get_delete_keys_keyboard(keys)
-    )
-    
-async def ask_key_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text(
-        "Введите имя для нового клиента (например, vpnuser1):"
-    )
-    context.user_data['await_key_name'] = True
-
-async def delete_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    fname = query.data.split('_', 1)[1]
-    await query.edit_message_text(
-        f"Вы уверены, что хотите удалить ключ <b>{fname}</b>?\nДействие необратимо!",
-        parse_mode="HTML",
-        reply_markup=get_confirm_delete_keyboard(fname)
-    )
-
-async def delete_key_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    fname = query.data.split('_', 2)[2]
-    client_name = fname[:-5] if fname.endswith(".ovpn") else fname
-
-    try:
-        # 1. Завершить сессию клиента (management socket)
-        kill_openvpn_session(client_name)
-
-        # 2. Revoke сертификат
-        revoke_cmd = f"cd {EASYRSA_DIR} && ./easyrsa --batch revoke {client_name}"
-        subprocess.run(revoke_cmd, shell=True, check=True)
-
-        # 3. Сгенерировать новый CRL
-        subprocess.run(f"cd {EASYRSA_DIR} && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl", shell=True, check=True)
-
-        # 4. Скопировать CRL в openvpn
-        crl_src = f"{EASYRSA_DIR}/pki/crl.pem"
-        crl_dst = "/etc/openvpn/crl.pem"
-        if os.path.exists(crl_src):
-            subprocess.run(f"cp {crl_src} {crl_dst}", shell=True, check=True)
-            os.chmod(crl_dst, 0o644)
-
-        # 5. Удалить все файлы клиента
-        ovpn_path = os.path.join(KEYS_DIR, fname)
-        if os.path.exists(ovpn_path):
-            os.remove(ovpn_path)
-        crt_path = f"{EASYRSA_DIR}/pki/issued/{client_name}.crt"
-        if os.path.exists(crt_path):
-            os.remove(crt_path)
-        key_path = f"{EASYRSA_DIR}/pki/private/{client_name}.key"
-        if os.path.exists(key_path):
-            os.remove(key_path)
-        req_path = f"{EASYRSA_DIR}/pki/reqs/{client_name}.req"
-        if os.path.exists(req_path):
-            os.remove(req_path)
-        ccd_path = os.path.join(CCD_DIR, client_name)
-        if os.path.exists(ccd_path):
-            os.remove(ccd_path)
-
-    except Exception as e:
-        await query.edit_message_text(f"Ошибка удаления ключа: {e}", reply_markup=get_main_keyboard())
-        return
-
-    await query.edit_message_text(f"Ключ <b>{fname}</b> удалён полностью!", parse_mode="HTML", reply_markup=get_main_keyboard())
-
-async def delete_key_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.edit_message_text("Удаление отменено.", reply_markup=get_main_keyboard())
+# ================== OVPN ГЕНЕРАЦИЯ / КЛЮЧИ ==================
 
 def generate_ovpn_for_client(
     client_name,
-    output_dir="/root",
-    template_path="/etc/openvpn/client-template.txt",
-    ca_path="/etc/openvpn/easy-rsa/pki/ca.crt",
+    output_dir=KEYS_DIR,
+    template_path=f"{OPENVPN_DIR}/client-template.txt",
+    ca_path=f"{EASYRSA_DIR}/pki/ca.crt",
     cert_path=None,
     key_path=None,
-    tls_crypt_path="/etc/openvpn/tls-crypt.key",
-    tls_auth_path="/etc/openvpn/tls-auth.key",
-    server_conf_path="/etc/openvpn/server.conf"
+    tls_crypt_path=f"{OPENVPN_DIR}/tls-crypt.key",
+    tls_auth_path=f"{OPENVPN_DIR}/tls-auth.key",
+    server_conf_path=f"{OPENVPN_DIR}/server.conf"
 ):
     if cert_path is None:
-        cert_path = f"/etc/openvpn/easy-rsa/pki/issued/{client_name}.crt"
+        cert_path = f"{EASYRSA_DIR}/pki/issued/{client_name}.crt"
     if key_path is None:
-        key_path = f"/etc/openvpn/easy-rsa/pki/private/{client_name}.key"
+        key_path = f"{EASYRSA_DIR}/pki/private/{client_name}.key"
 
     ovpn_file = os.path.join(output_dir, f"{client_name}.ovpn")
 
@@ -883,25 +352,21 @@ def generate_ovpn_for_client(
     return ovpn_file
 
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Этап: ждём имя
     if context.user_data.get('await_key_name'):
         key_name = update.message.text.strip()
         ovpn_file = os.path.join(KEYS_DIR, f"{key_name}.ovpn")
         if os.path.exists(ovpn_file):
             await update.message.reply_text(
-                f"Клиент с именем <b>{key_name}</b> уже существует! Введите другое имя.",
+                f"Клиент <b>{key_name}</b> уже существует! Введите другое имя.",
                 parse_mode="HTML"
             )
             return
         context.user_data['new_key_name'] = key_name
         context.user_data['await_key_name'] = False
         context.user_data['await_key_expiry'] = True
-        await update.message.reply_text(
-            "Введите срок действия ключа в днях (по умолчанию 825):"
-        )
+        await update.message.reply_text("Введите срок действия ключа в днях (по умолчанию 825):")
         return
 
-    # Этап: ждём срок
     if context.user_data.get('await_key_expiry'):
         try:
             days = int(update.message.text.strip())
@@ -911,96 +376,114 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data['await_key_expiry'] = False
 
         key_name = context.user_data['new_key_name']
-        cert_path = f"{EASYRSA_DIR}/pki/issued/{key_name}.crt"
-        key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
-
-        if not (os.path.exists(cert_path) and os.path.exists(key_path)):
-            try:
-                subprocess.run(
-                    f"EASYRSA_CERT_EXPIRE={days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
-                    shell=True, check=True, cwd=EASYRSA_DIR
-                )
-            except subprocess.CalledProcessError as e:
-                await update.message.reply_text(
-                    f"Ошибка генерации сертификата: {e}", parse_mode="HTML"
-                )
-                context.user_data.pop('new_key_name', None)
-                context.user_data.pop('new_key_expiry', None)
-                return
+        try:
+            subprocess.run(
+                f"EASYRSA_CERT_EXPIRE={days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
+                shell=True, check=True, cwd=EASYRSA_DIR
+            )
+        except subprocess.CalledProcessError as e:
+            await update.message.reply_text(f"Ошибка генерации сертификата: {e}", parse_mode="HTML")
+            context.user_data.pop('new_key_name', None)
+            context.user_data.pop('new_key_expiry', None)
+            return
 
         ovpn_path = generate_ovpn_for_client(key_name)
-
         await update.message.reply_text(
-            f"Клиент <b>{key_name}</b> успешно создан!\nСрок действия: {days} дней.\nСохраняется в: {ovpn_path}",
+            f"Клиент <b>{key_name}</b> успешно создан!\nСрок действия: {days} дней.\nФайл: {ovpn_path}",
             parse_mode="HTML"
         )
-
         with open(ovpn_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=InputFile(f),
                 filename=f"{key_name}.ovpn"
             )
-
         context.user_data.pop('new_key_name', None)
         context.user_data.pop('new_key_expiry', None)
         return
 
-async def restore_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.edit_message_text(
-        "Пожалуйста, отправьте архив с бэкапом (.tar.gz) в этот чат."
-    )
-    context.user_data['restore_wait_file'] = True
-
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
+async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys = get_ovpn_files()
+    if not keys:
+        await update.callback_query.edit_message_text("Нет ключей для обновления.", reply_markup=get_main_keyboard())
         return
-    if context.user_data.get('restore_wait_file'):
-        file = update.message.document
-        if file and (
-            file.mime_type in ['application/gzip', 'application/x-gzip', 'application/x-tar', 'application/octet-stream']
-            or file.file_name.endswith('.tar.gz') or file.file_name.endswith('.tgz') or file.file_name.endswith('.tar')
-        ):
-            file_id = file.file_id
-            file_name = file.file_name
-            new_path = f"/root/{file_name}"
-            new_file = await context.bot.get_file(file_id)
-            await new_file.download_to_drive(new_path)
-            context.user_data['restore_wait_file'] = False
-            context.user_data['restore_file_path'] = new_path
+    keyboard = []
+    for i, fname in enumerate(keys, 1):
+        keyboard.append([InlineKeyboardButton(f"{i}. {fname[:-5]}", callback_data=f"renew_{fname}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
+    await update.callback_query.edit_message_text(
+        "Выберите ключ для обновления:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Да, восстановить", callback_data='restore_confirm')],
-                [InlineKeyboardButton("❌ Нет, отменить", callback_data='restore_cancel')],
-            ])
-            await update.message.reply_text(
-                f"Бэкап получен: <code>{file_name}</code>\nВосстановить этот архив?",
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-        else:
-            await update.message.reply_text("Пожалуйста, отправьте архив в формате .tar.gz")
-    else:
-        await update.message.reply_text("Для восстановления сначала нажмите 'Восстановить бэкап'.")
+async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    fname = query.data.split('_', 1)[1]
+    key_name = fname[:-5] if fname.endswith('.ovpn') else fname
+    context.user_data['renew_key_name'] = key_name
+    context.user_data['await_renew_expiry'] = True
+    await query.edit_message_text(
+        f"Введите сколько дней добавить к сроку действия ключа <b>{key_name}</b>:",
+        parse_mode="HTML"
+    )
 
-async def restore_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file_path = context.user_data.get('restore_file_path')
-    if file_path and os.path.exists(file_path):
-        # Распаковываем архив в корень /
-        subprocess.run(f"tar -xzvf {file_path} -C /", shell=True)
-        await update.callback_query.answer("Восстановление завершено!")
-        await update.callback_query.edit_message_text("✅ Архив успешно восстановлен! Все файлы восстановлены.", reply_markup=get_main_keyboard())
-        context.user_data['restore_file_path'] = None
-    else:
-        await update.callback_query.answer("Файл для восстановления не найден!", show_alert=True)
-        await update.callback_query.edit_message_text("❌ Ошибка: файл не найден или не был отправлен.", reply_markup=get_main_keyboard())
+async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('await_renew_expiry'):
+        return
+    key_name = context.user_data['renew_key_name']
+    cert_path = f"{EASYRSA_DIR}/pki/issued/{key_name}.crt"
+    key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
+    req_path = f"{EASYRSA_DIR}/pki/reqs/{key_name}.req"
+    if not os.path.exists(cert_path):
+        await update.message.reply_text("Сертификат не найден для обновления!")
+        context.user_data.pop('renew_key_name', None)
+        context.user_data.pop('await_renew_expiry', None)
+        return
+    try:
+        days_to_add = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("Некорректное число дней. Попробуйте ещё раз.")
+        return
 
-async def restore_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['restore_file_path'] = None
-    await update.callback_query.answer("Отменено.")
-    await update.callback_query.edit_message_text("Восстановление отменено.", reply_markup=get_main_keyboard())
+    with open(cert_path, "rb") as f:
+        cert_data = f.read()
+        cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
+        not_after = cert.get_notAfter().decode("ascii")
+        expiry_date = datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
+
+    new_expiry_date = expiry_date + timedelta(days=days_to_add)
+    total_days = (new_expiry_date - datetime.utcnow()).days
+
+    for path in [cert_path, key_path, req_path]:
+        if os.path.exists(path):
+            os.remove(path)
+
+    try:
+        subprocess.run(
+            f"EASYRSA_CERT_EXPIRE={total_days} {EASYRSA_DIR}/easyrsa --batch build-client-full {key_name} nopass",
+            shell=True, check=True, cwd=EASYRSA_DIR
+        )
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"Ошибка обновления сертификата: {e}", parse_mode="HTML")
+        context.user_data.pop('renew_key_name', None)
+        context.user_data.pop('await_renew_expiry', None)
+        return
+
+    ovpn_path = generate_ovpn_for_client(key_name)
+    await update.message.reply_text(
+        f"Ключ <b>{key_name}</b> обновлён!\nНовый срок действия: {total_days} дней.\nФайл: {ovpn_path}",
+        parse_mode="HTML"
+    )
+    with open(ovpn_path, "rb") as f:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=InputFile(f),
+            filename=f"{key_name}.ovpn"
+        )
+    context.user_data.pop('renew_key_name', None)
+    context.user_data.pop('await_renew_expiry', None)
+
+# ================== ПРОЧЕЕ (лог, бэкап и т.д.) ==================
 
 def get_status_log_tail(n=40):
     try:
@@ -1009,6 +492,201 @@ def get_status_log_tail(n=40):
         return "".join(lines[-n:])
     except Exception as e:
         return f"Ошибка чтения status.log: {e}"
+
+def create_backup():
+    backup_file = f"{BACKUP_DIR}/vpn_backup_{date.today().strftime('%Y%m%d')}.tar.gz"
+    ovpn_files = [os.path.join(KEYS_DIR, f) for f in os.listdir(KEYS_DIR) if f.endswith(".ovpn")]
+    files_to_backup = ovpn_files + [OPENVPN_DIR, IPTABLES_DIR]
+    cmd = ["tar", "-czvf", backup_file] + files_to_backup
+    subprocess.run(cmd)
+    return backup_file
+
+async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    backup_file = create_backup()
+    with open(backup_file, "rb") as f:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=InputFile(f),
+            filename=os.path.basename(backup_file)
+        )
+
+# ================== УВЕДОМЛЕНИЯ ==================
+
+def is_notify_enabled():
+    return os.path.exists(NOTIFY_FILE)
+
+def set_notify(flag):
+    if flag:
+        os.makedirs(os.path.dirname(NOTIFY_FILE), exist_ok=True)
+        with open(NOTIFY_FILE, "w") as f:
+            f.write("on")
+    else:
+        if os.path.exists(NOTIFY_FILE):
+            os.remove(NOTIFY_FILE)
+
+async def notify_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # (Эта функция не вызывается сейчас кнопкой — можно удалить при желании)
+    query = update.callback_query
+    enabled = is_notify_enabled()
+    set_notify(not enabled)
+    if not enabled:
+        await query.edit_message_text("✅ Уведомления о новых подключениях ВКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+    else:
+        await query.edit_message_text("🚫 Уведомления о новых подключениях ВЫКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+
+# Главный мониторинг
+async def check_new_connections(app: Application):
+    global clients_last_online, last_alert_time
+    import asyncio
+    while True:
+        try:
+            clients, online_names, tunnel_ips = parse_openvpn_status()
+            online_count = len(online_names)
+            total_keys = len(get_ovpn_files())
+            now = time.time()
+
+            # --- Тревога 0 клиентов ---
+            if online_count == 0 and total_keys > 0:
+                if now - last_alert_time > ALERT_INTERVAL_SEC:
+                    await app.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text="❌ Все клиенты оффлайн! Возможна блокировка IP сервера или падение OpenVPN.",
+                        parse_mode="HTML"
+                    )
+                    last_alert_time = now
+            # --- Тревога: мало клиентов ---
+            elif 0 < online_count < MIN_ONLINE_ALERT:
+                if now - last_alert_time > ALERT_INTERVAL_SEC:
+                    await app.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"⚠️ Онлайн мало: {online_count} из {total_keys}. Возможные проблемы (блокировка / сеть).",
+                        parse_mode="HTML"
+                    )
+                    last_alert_time = now
+            else:
+                # Если всё нормальное — сбрасываем, чтобы при следующем падении тревога пришла сразу
+                if online_count >= MIN_ONLINE_ALERT:
+                    last_alert_time = 0
+
+            # Уведомления о новых подключениях удалены!
+            
+            clients_last_online = set(online_names)
+            await asyncio.sleep(10)
+        except Exception as e:
+            print(f"[check_new_connections] Ошибка цикла: {e}")
+            await asyncio.sleep(10)
+
+# ================== ХЕНДЛЕРЫ TELEGRAM ==================
+
+async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('await_key_name') or context.user_data.get('await_key_expiry'):
+        await create_key_handler(update, context)
+    elif context.user_data.get('await_renew_expiry'):
+        await renew_key_expiry_handler(update, context)
+    else:
+        await update.message.reply_text("Неизвестный ввод. Используй меню.", reply_markup=get_main_keyboard())
+
+async def enable_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    all_keys = get_ovpn_files()
+    keyboard = []
+    for fname in sorted(all_keys):
+        cname = fname[:-5]
+        if is_client_ccd_disabled(cname):
+            keyboard.append([InlineKeyboardButton(f"✅ Включить {cname}", callback_data=f"enable_{cname}")])
+    if not keyboard:
+        keyboard.append([InlineKeyboardButton("Нет заблокированных клиентов", callback_data="home")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="home")])
+    await query.edit_message_text("Выбери клиента для включения:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def disable_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    all_keys = get_ovpn_files()
+    keyboard = []
+    for fname in sorted(all_keys):
+        cname = fname[:-5]
+        if not is_client_ccd_disabled(cname):
+            keyboard.append([InlineKeyboardButton(f"⚠️ Отключить {cname}", callback_data=f"disable_{cname}")])
+    if not keyboard:
+        keyboard.append([InlineKeyboardButton("Нет клиентов для отключения", callback_data="home")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="home")])
+    await query.edit_message_text("Выбери клиента для отключения:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def enable_client_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    cname = query.data.split('_', 1)[1]
+    unblock_client_ccd(cname)
+    await query.edit_message_text(f"Клиент <b>{cname}</b> включён.", parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def disable_client_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    cname = query.data.split('_', 1)[1]
+    block_client_ccd(cname)
+    killed = kill_openvpn_session(cname)
+    msg = f"Клиент <b>{cname}</b> отключён."
+    msg += "\nСессия завершена." if killed else "\nАктивная сессия (если была) завершится при переподключении."
+    await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    await update.message.reply_text("Добро пожаловать в VPN бот!", reply_markup=get_main_keyboard())
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    msg = format_clients_by_certs()
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys_info = get_cert_expiry_info()
+    text = "<b>Сроки действия клиентских ключей:</b>\n"
+    if not keys_info:
+        text += "Нет активных ключей."
+    else:
+        for client_name, days_left, expiry_date in sorted(keys_info):
+            if days_left < 0:
+                status = "❌ истёк"
+            elif days_left < 7:
+                status = f"⚠️ {days_left} дней"
+            else:
+                status = f"{days_left} дней"
+            text += f"• <b>{client_name}</b>: {status} (до {expiry_date.strftime('%Y-%m-%d')})\n"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    clients, online_names, tunnel_ips = parse_openvpn_status()
+    # Формируем только онлайн
+    res = []
+    for c in clients:
+        if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
+            tunnel_ip = tunnel_ips.get(c['name'], 'нет')
+            res.append(
+                f"🟢 <b>{c['name']}</b>\n"
+                f"🌐 <code>{c.get('ip','нет')}</code>\n"
+                f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
+                f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
+                f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
+                + "-"*15
+            )
+    text = "<b>Онлайн клиенты:</b>\n\n" + ("\n".join(res) if res else "Нет активных клиентов.")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def log_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1019,60 +697,129 @@ async def log_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for msg in msgs[1:]:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
 
-def is_notify_enabled():
-    return os.path.exists(NOTIFY_FILE)
+async def send_keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    keys = get_ovpn_files()
+    await update.message.reply_text("Выберите номер ключа для отправки:", reply_markup=get_keys_keyboard(keys))
 
-def set_notify(flag):
-    if flag:
-        with open(NOTIFY_FILE, "w") as f:
-            f.write("on")
-    else:
-        if os.path.exists(NOTIFY_FILE):
-            os.remove(NOTIFY_FILE)
+async def send_ovpn_file(update: Update, context: ContextTypes.DEFAULT_TYPE, filename):
+    file_path = os.path.join(KEYS_DIR, filename)
+    if not os.path.exists(file_path):
+        if update.callback_query:
+            await update.callback_query.edit_message_text(f"Файл {filename} не найден!", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text(f"Файл {filename} не найден!", reply_markup=get_main_keyboard())
+        return
+    with open(file_path, "rb") as f:
+        await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f), filename=filename)
 
-async def notify_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys = get_ovpn_files()
+    if not keys:
+        await update.callback_query.edit_message_text("Нет ключей для удаления.", reply_markup=get_main_keyboard())
+        return
+    await update.callback_query.edit_message_text("Выберите ключ для удаления:", reply_markup=get_delete_keys_keyboard(keys))
+
+async def ask_key_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text("Введите имя для нового клиента (например, vpnuser1):")
+    context.user_data['await_key_name'] = True
+
+async def delete_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    enabled = is_notify_enabled()
-    set_notify(not enabled)
-    if not enabled:
-        await query.edit_message_text("✅ Уведомления о новых подключениях ВКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
-    else:
-        await query.edit_message_text("🚫 Уведомления о новых подключениях ВЫКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+    fname = query.data.split('_', 1)[1]
+    await query.edit_message_text(
+        f"Удалить ключ <b>{fname}</b>? Это необратимо!",
+        parse_mode="HTML",
+        reply_markup=get_confirm_delete_keyboard(fname)
+    )
 
-async def check_new_connections(app: Application):
-    global clients_last_online
-    import asyncio
-    while True:
-        clients, online_names, tunnel_ips = parse_openvpn_status()
-        if is_notify_enabled():
-            new_clients = online_names - clients_last_online
-            if new_clients:
-                msg = "<b>Новые подключения:</b>\n\n"
-                for cname in new_clients:
-                    tunnel_ip = tunnel_ips.get(cname, 'нет данных')
-                    now_tm = datetime.now(pytz.utc).astimezone(TM_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                    msg += f"🟢 <b>{cname}</b> (<code>{tunnel_ip}</code>) — {now_tm}\n"
-                await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
-        if is_notify_disconnect_enabled():
-            disconnected_clients = clients_last_online - online_names
-            if disconnected_clients:
-                msg = "<b>Отключения:</b>\n\n"
-                for cname in disconnected_clients:
-                    now_tm = datetime.now(pytz.utc).astimezone(TM_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                    msg += f"🔴 <b>{cname}</b> — {now_tm}\n"
-                await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
-        clients_last_online = set(online_names)
-        await asyncio.sleep(10)
-
-async def notify_disconnect_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_key_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    enabled = is_notify_disconnect_enabled()
-    set_notify_disconnect(not enabled)
-    if not enabled:
-        await query.edit_message_text("✅ Уведомления об отключениях ВКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+    fname = query.data.split('_', 2)[2]
+    client_name = fname[:-5] if fname.endswith(".ovpn") else fname
+    try:
+        kill_openvpn_session(client_name)
+        subprocess.run(f"cd {EASYRSA_DIR} && ./easyrsa --batch revoke {client_name}", shell=True, check=True)
+        subprocess.run(f"cd {EASYRSA_DIR} && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl", shell=True, check=True)
+        crl_src = f"{EASYRSA_DIR}/pki/crl.pem"
+        crl_dst = "/etc/openvpn/crl.pem"
+        if os.path.exists(crl_src):
+            subprocess.run(f"cp {crl_src} {crl_dst}", shell=True, check=True)
+            os.chmod(crl_dst, 0o644)
+        paths = [
+            os.path.join(KEYS_DIR, fname),
+            f"{EASYRSA_DIR}/pki/issued/{client_name}.crt",
+            f"{EASYRSA_DIR}/pki/private/{client_name}.key",
+            f"{EASYRSA_DIR}/pki/reqs/{client_name}.req",
+            os.path.join(CCD_DIR, client_name)
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception as e:
+        await query.edit_message_text(f"Ошибка удаления: {e}", reply_markup=get_main_keyboard())
+        return
+    await query.edit_message_text(f"Ключ <b>{fname}</b> удалён.", parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def delete_key_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text("Удаление отменено.", reply_markup=get_main_keyboard())
+
+async def restore_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Отправьте архив (.tar.gz) сюда.")
+    context.user_data['restore_wait_file'] = True
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    if context.user_data.get('restore_wait_file'):
+        file = update.message.document
+        if file and (
+            file.mime_type in ['application/gzip', 'application/x-gzip', 'application/x-tar', 'application/octet-stream']
+            or file.file_name.endswith(('.tar.gz', '.tgz', '.tar'))
+        ):
+            file_id = file.file_id
+            file_name = file.file_name
+            new_path = f"/root/{file_name}"
+            new_file = await context.bot.get_file(file_id)
+            await new_file.download_to_drive(new_path)
+            context.user_data['restore_wait_file'] = False
+            context.user_data['restore_file_path'] = new_path
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да, восстановить", callback_data='restore_confirm')],
+                [InlineKeyboardButton("❌ Нет, отменить", callback_data='restore_cancel')],
+            ])
+            await update.message.reply_text(
+                f"Файл получен: <code>{file_name}</code>\nВосстановить?",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+        else:
+            await update.message.reply_text("Нужен архив .tar.gz")
     else:
-        await query.edit_message_text("🚫 Уведомления об отключениях ВЫКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
-        
+        await update.message.reply_text("Сначала нажмите 'Восстан.бэкап' в меню.")
+
+async def restore_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file_path = context.user_data.get('restore_file_path')
+    if file_path and os.path.exists(file_path):
+        subprocess.run(f"tar -xzvf {file_path} -C /", shell=True)
+        await update.callback_query.answer("Готово!")
+        await update.callback_query.edit_message_text("✅ Восстановлено.", reply_markup=get_main_keyboard())
+        context.user_data['restore_file_path'] = None
+    else:
+        await update.callback_query.answer("Файл не найден!", show_alert=True)
+        await update.callback_query.edit_message_text("❌ Ошибка: файл не найден.", reply_markup=get_main_keyboard())
+
+async def restore_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['restore_file_path'] = None
+    await update.callback_query.answer("Отменено.")
+    await update.callback_query.edit_message_text("Восстановление отменено.", reply_markup=get_main_keyboard())
+
+# ================== BUTTON HANDLER ==================
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
@@ -1088,7 +835,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
         await renew_key_select_handler(update, context)
-    # ... остальные elif ...
     elif data == 'stats':
         clients, online_names, tunnel_ips = parse_openvpn_status()
         ipp_map = read_ipp_file("/etc/openvpn/ipp.txt")
@@ -1097,30 +843,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for msg in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
-    # ... и все остальные elif на одном уровне ...
     elif data == 'online':
         clients, online_names, tunnel_ips = parse_openvpn_status()
-        msgs = split_message(format_online_clients(clients, online_names, tunnel_ips))
+        text = format_online_clients(clients, online_names, tunnel_ips)
+        msgs = split_message(text)
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
-        for msg in msgs[1:]:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+        for m in msgs[1:]:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=m, parse_mode="HTML")
     elif data == 'keys_expiry':
         await view_keys_expiry_handler(update, context)
     elif data == 'help':
         msgs = split_message(HELP_TEXT)
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
-        for msg in msgs[1:]:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+        for m in msgs[1:]:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=m, parse_mode="HTML")
     elif data == 'restore_confirm':
         await restore_confirm_handler(update, context)
     elif data == 'restore_cancel':
-        await restore_cancel_handler(update, context)        
+        await restore_cancel_handler(update, context)
     elif data == 'send_keys':
         keys = get_ovpn_files()
-        await query.edit_message_text(
-            "Выберите номер ключа для отправки:",
-            reply_markup=get_keys_keyboard(keys)
-        )
+        await query.edit_message_text("Выберите ключ:", reply_markup=get_keys_keyboard(keys))
     elif data.startswith('key_'):
         idx = int(data.split('_')[1]) - 1
         keys = get_ovpn_files()
@@ -1141,10 +884,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'restore':
         await restore_request(update, context)
     elif data == 'home':
-        await query.edit_message_text(
-            "Добро пожаловать в VPN бот!",
-            reply_markup=get_main_keyboard()
-        )
+        await query.edit_message_text("Добро пожаловать в VPN бот!", reply_markup=get_main_keyboard())
     elif data == 'enable':
         await enable_request(update, context)
     elif data.startswith('enable_'):
@@ -1155,41 +895,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await disable_client_handler(update, context)
     elif data == 'log':
         await log_request(update, context)
-    elif data == 'notify':
-        await notify_toggle(update, context)
-    elif data == 'notify_disconnect':           # <-- ЭТО ДОБАВЬ!
-        await notify_disconnect_toggle(update, context)
-    else:
-        await query.edit_message_text("Команда не реализована.", reply_markup=get_main_keyboard())    
-
-def create_backup():
-    backup_file = f"{BACKUP_DIR}/vpn_backup_{date.today().strftime('%Y%m%d')}.tar.gz"
-    ovpn_files = [os.path.join(KEYS_DIR, f) for f in os.listdir(KEYS_DIR) if f.endswith(".ovpn")]
-    files_to_backup = ovpn_files + [OPENVPN_DIR, IPTABLES_DIR]
-    cmd = ["tar", "-czvf", backup_file] + files_to_backup
-    subprocess.run(cmd)
-    return backup_file
-
-async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    backup_file = create_backup()
-    with open(backup_file, "rb") as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=InputFile(f),
-            filename=os.path.basename(backup_file)
+    elif data == 'block_alert':
+        await query.edit_message_text(
+            "Тревога активна в фоне.\n"
+            f"Порог: < {MIN_ONLINE_ALERT} / интервал антиспама: {ALERT_INTERVAL_SEC}s.\n"
+            "Изменить можно в коде (MIN_ONLINE_ALERT / ALERT_INTERVAL_SEC).",
+            reply_markup=get_main_keyboard()
         )
+    else:
+        await query.edit_message_text("Команда не реализована.", reply_markup=get_main_keyboard())
+
+# ================== DOCUMENT / FILE HANDLERS ==================
+
+async def universal_guard(update: Update):
+    if update.effective_user and update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return False
+    return True
+
+# ================== MAIN ==================
 
 def main():
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("online", online_command))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(CallbackQueryHandler(restore_confirm_handler, pattern='^restore_confirm$'))
     app.add_handler(CallbackQueryHandler(restore_cancel_handler, pattern='^restore_cancel$'))
-    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+
     import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
