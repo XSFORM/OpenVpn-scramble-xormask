@@ -3,7 +3,9 @@ import os
 import subprocess
 import time
 from datetime import date, datetime, timedelta
+from typing import Optional, Tuple, List
 import glob
+import json
 from OpenSSL import crypto
 import pytz
 
@@ -16,9 +18,43 @@ from telegram.ext import (
 
 from config import TOKEN, ADMIN_ID
 
-# --- Версия и URL для обновления (добавлено) ---
-BOT_VERSION = "2025-09-02"
+# ---------------- Версия и обновление (вывод команд) ----------------
+BOT_VERSION = "2025-09-02-fixed1"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
+
+def build_update_commands():
+    short_cmd = f"curl -L -o /root/monitor_bot/openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && systemctl restart vpn_bot.service"
+    safe_cmd = (
+        "cd /root/monitor_bot && "
+        "cp openvpn_monitor_bot.py openvpn_monitor_bot.py.bak_$(date +%Y%m%d_%H%M%S) && "
+        f"curl -L -o openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && "
+        "python3 -m py_compile openvpn_monitor_bot.py && "
+        "systemctl restart vpn_bot.service"
+    )
+    return short_cmd, safe_cmd
+
+async def show_update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    short_cmd, safe_cmd = build_update_commands()
+    text = (
+        f"<b>Команды обновления (версия {BOT_VERSION})</b>\n\n"
+        "Простая:\n<code>" + short_cmd + "</code>\n\n"
+        "С бэкапом и проверкой:\n<code>" + safe_cmd + "</code>\n\n"
+        "Откат (пример):\n<code>cp /root/monitor_bot/openvpn_monitor_bot.py.bak_YYYYMMDD_HHMMSS "
+        "/root/monitor_bot/openvpn_monitor_bot.py && systemctl restart vpn_bot.service</code>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=get_main_keyboard())
+
+async def send_update_cmd_via_button(chat_id: int, bot):
+    short_cmd, safe_cmd = build_update_commands()
+    text = (
+        f"<b>Обновление бота</b>\nВерсия: <code>{BOT_VERSION}</code>\n\n"
+        "Простая:\n<code>" + short_cmd + "</code>\n\n"
+        "Расширенная (с бэкапом):\n<code>" + safe_cmd + "</code>"
+    )
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
 
 # --- Константы путей ---
 KEYS_DIR = "/root"
@@ -30,7 +66,6 @@ STATUS_LOG = "/var/log/openvpn/status.log"
 CCD_DIR = "/etc/openvpn/ccd"
 
 NOTIFY_FILE = "/root/monitor_bot/notify.flag"
-
 TM_TZ = pytz.timezone("Asia/Ashgabat")
 MGMT_SOCKET = "/var/run/openvpn.sock"
 
@@ -40,7 +75,19 @@ ALERT_INTERVAL_SEC = 300
 last_alert_time = 0
 clients_last_online = set()
 
-# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+# --- Учёт трафика ---
+TRAFFIC_DB_PATH = "/root/monitor_bot/traffic_usage.json"
+traffic_usage = {}
+_last_session_state = {}
+_last_traffic_save_time = 0
+TRAFFIC_SAVE_INTERVAL = 60
+
+# --- Стрелки для отчёта трафика ---
+RX_ARROW = "🔻"   # server received from client (upload клиента)
+TX_ARROW = "🔺"   # server sent to client (download клиента)
+ARROWS_SPACING = ""
+
+# ================== Базовые вспомогательные ==================
 
 def get_cert_expiry_info():
     cert_dir = f"{EASYRSA_DIR}/pki/issued"
@@ -82,10 +129,7 @@ def format_all_keys_with_status_compact(keys_dir=KEYS_DIR, clients_online=set(),
             status = "⛔"
         tunnel_ip = tunnel_ips.get(key_name) or ipp_map.get(key_name, "Н/Д")
         client_info = next((c for c in clients if c['name'] == key_name), None)
-        if client_info and key_name in clients_online and not is_client_ccd_disabled(key_name):
-            real_ip = client_info.get('ip', 'Н/Д')
-        else:
-            real_ip = "Н/Д"
+        real_ip = client_info.get('ip', 'Н/Д') if client_info and key_name in clients_online and not is_client_ccd_disabled(key_name) else "Н/Д"
         result += f"{idx}. | {status} | <b>{key_name}</b> | <code>{tunnel_ip}</code> | <code>{real_ip}</code>\n"
     if not files:
         result += "Нет ключей."
@@ -163,6 +207,14 @@ def bytes_to_mb(b):
     except:
         return "0 MB"
 
+def format_tm_time(dt_str):
+    try:
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+        dt = pytz.utc.localize(dt).astimezone(TM_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return dt_str
+
 def split_message(text, max_length=4000):
     lines = text.split('\n')
     messages = []
@@ -176,14 +228,6 @@ def split_message(text, max_length=4000):
     if current:
         messages.append(current)
     return messages
-
-def format_tm_time(dt_str):
-    try:
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-        dt = pytz.utc.localize(dt).astimezone(TM_TZ)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return dt_str
 
 def get_ovpn_files():
     return [f for f in os.listdir(KEYS_DIR) if f.endswith(".ovpn")]
@@ -200,14 +244,13 @@ def is_client_ccd_disabled(client_name):
         return False
 
 def block_client_ccd(client_name):
-    ccd_path = os.path.join(CCD_DIR, client_name)
-    with open(ccd_path, "w") as f:
+    with open(os.path.join(CCD_DIR, client_name), "w") as f:
         f.write("disable\n")
 
 def unblock_client_ccd(client_name):
-    ccd_path = os.path.join(CCD_DIR, client_name)
-    if os.path.exists(ccd_path):
-        os.remove(ccd_path)
+    p = os.path.join(CCD_DIR, client_name)
+    if os.path.exists(p):
+        os.remove(p)
 
 def kill_openvpn_session(client_name):
     if os.path.exists(MGMT_SOCKET):
@@ -218,13 +261,376 @@ def kill_openvpn_session(client_name):
             print(f"[kill_openvpn_session] Ошибка: {e}")
     return False
 
-# ================== UI (Клавиатуры / HELP) ==================
+# --- Форматирование трафика ---
+def format_bytes_gb(b):
+    try:
+        return f"{int(b)/1024/1024/1024:.2f} GB"
+    except:
+        return "0.00 GB"
+
+def format_gb(v_bytes):
+    try:
+        return f"{v_bytes/1024/1024/1024:.2f} GB"
+    except Exception:
+        return "0.00 GB"
+
+# ================== Трафик ==================
+
+def load_traffic_db():
+    global traffic_usage
+    try:
+        if os.path.exists(TRAFFIC_DB_PATH):
+            with open(TRAFFIC_DB_PATH, "r") as f:
+                raw = json.load(f)
+            migrated = {}
+            changed = False
+            for k, v in raw.items():
+                if isinstance(v, dict) and 'rx' in v and 'tx' in v:
+                    migrated[k] = {'rx': int(v.get('rx', 0)), 'tx': int(v.get('tx', 0))}
+                elif isinstance(v, int):
+                    migrated[k] = {'rx': v, 'tx': 0}
+                    changed = True
+                else:
+                    migrated[k] = {'rx': 0, 'tx': 0}
+                    changed = True
+            traffic_usage = migrated
+            if changed:
+                save_traffic_db(force=True)
+        else:
+            traffic_usage = {}
+    except Exception as e:
+        print(f"[traffic] load error: {e}")
+        traffic_usage = {}
+
+def save_traffic_db(force=False):
+    global _last_traffic_save_time
+    now = time.time()
+    if not force and now - _last_traffic_save_time < TRAFFIC_SAVE_INTERVAL:
+        return
+    try:
+        tmp = TRAFFIC_DB_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(traffic_usage, f)
+        os.replace(tmp, TRAFFIC_DB_PATH)
+        _last_traffic_save_time = now
+    except Exception as e:
+        print(f"[traffic] save error: {e}")
+
+def build_traffic_report():
+    if not traffic_usage:
+        return "<b>Трафик:</b>\nПока нет накопленных данных."
+    items = sorted(
+        traffic_usage.items(),
+        key=lambda x: (x[1]['rx'] + x[1]['tx']) if isinstance(x[1], dict) else x[1],
+        reverse=True
+    )
+    lines = ["<b>Использование трафика:</b>"]
+    for name, val in items:
+        if isinstance(val, dict):
+            rx = val.get('rx', 0)
+            tx = val.get('tx', 0)
+            total = rx + tx
+            lines.append(
+                f"• <b>{name}</b>: {RX_ARROW}{ARROWS_SPACING}{format_gb(rx)} "
+                f"{TX_ARROW}{ARROWS_SPACING}{format_gb(tx)} (= --{format_gb(total)}--)"
+            )
+        else:
+            lines.append(f"• <b>{name}</b>: Σ --{format_gb(val)}--")
+    return "\n".join(lines)
+
+def update_traffic_from_status(clients):
+    global traffic_usage, _last_session_state
+    changed = False
+    for c in clients:
+        name = c['name']
+        try:
+            recv = int(c.get('bytes_recv', 0))
+            sent = int(c.get('bytes_sent', 0))
+        except:
+            continue
+        connected_since = c.get('connected_since', '')
+        prev = _last_session_state.get(name)
+
+        if name not in traffic_usage:
+            traffic_usage[name] = {'rx': 0, 'tx': 0}
+
+        if prev is None or prev['connected_since'] != connected_since:
+            _last_session_state[name] = {
+                'connected_since': connected_since,
+                'rx': recv,
+                'tx': sent
+            }
+            continue
+
+        delta_rx = recv - prev['rx']
+        delta_tx = sent - prev['tx']
+
+        if delta_rx > 0:
+            traffic_usage[name]['rx'] += delta_rx
+            prev['rx'] = recv
+            changed = True
+        else:
+            prev['rx'] = recv
+
+        if delta_tx > 0:
+            traffic_usage[name]['tx'] += delta_tx
+            prev['tx'] = sent
+            changed = True
+        else:
+            prev['tx'] = sent
+
+    if changed:
+        save_traffic_db()
+
+def clear_traffic_stats():
+    """Полная очистка накопленного трафика + baseline (делается бэкап файла)."""
+    global traffic_usage, _last_session_state
+    try:
+        if os.path.exists(TRAFFIC_DB_PATH):
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            subprocess.run(f"cp {TRAFFIC_DB_PATH} {TRAFFIC_DB_PATH}.bak_{ts}", shell=True)
+    except Exception as e:
+        print(f"[traffic] backup before clear error: {e}")
+    traffic_usage = {}
+    _last_session_state = {}
+    save_traffic_db(force=True)
+
+# ================== REMOTE (массовое обновление remote) ==================
+### REMOTE UPDATE START (упрощённая версия без regex, совместима с Python 3.9)
+
+def parse_new_remote(input_str: str) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Принимает строку вида:
+      host
+      host:port
+    Возвращает (host, port_or_None).
+    """
+    s = input_str.strip()
+    if not s:
+        return None, None
+    if ':' in s:
+        host, port_part = s.rsplit(':', 1)
+        host = host.strip()
+        try:
+            port = int(port_part)
+            if 1 <= port <= 65535:
+                return host, port
+        except:
+            return host, None
+        return host, None
+    return s, None
+
+def replace_remote_line(line: str, new_host: str, new_port: Optional[int]):
+    """
+    Если строка начинается с 'remote ' (игнорируя пробелы в начале),
+    заменяем host и (если задан) порт.
+    Возвращаем (новая_строка, старый_host, старый_port) либо (line, None, None).
+    """
+    original = line
+    stripped = line.lstrip()
+    if not stripped.startswith("remote "):
+        return original, None, None
+
+    # Ведущие пробелы
+    leading = line[:len(line) - len(stripped)]
+    parts = stripped.split()
+    if len(parts) < 3:
+        return original, None, None  # не стандартный формат
+
+    old_host = parts[1]
+    old_port = parts[2]
+
+    parts[1] = new_host
+    if new_port is not None:
+        parts[2] = str(new_port)
+
+    new_line = leading + " ".join(parts)
+    if not new_line.endswith("\n"):
+        new_line += "\n"
+    return new_line, old_host, old_port
+
+def update_remote_in_file(path: str, new_host: str, new_port: Optional[int], ts: str):
+    """
+    Обновляет первую найденную строку remote в файле.
+    Делает бэкап path.bak_<ts>. Возвращает dict результата или None если не найдено.
+    """
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return {"file": path, "error": f"read error: {e}"}
+
+    changed = False
+    old_host = old_port = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("remote "):
+            new_line, oh, op = replace_remote_line(line, new_host, new_port)
+            if oh is not None:
+                # Если реально ничего не меняется (тот же host и порт) — пропускаем (не плодим бэкап)
+                if oh == new_host and ((new_port is None and op == op) or (new_port is not None and str(new_port) == op)):
+                    break
+                lines[i] = new_line
+                old_host, old_port = oh, op
+                changed = True
+                break
+
+    if not changed:
+        return None
+
+    backup_path = f"{path}.bak_{ts}"
+    try:
+        subprocess.run(f"cp '{path}' '{backup_path}'", shell=True, check=False)
+        with open(path, "w") as f:
+            f.writelines(lines)
+        return {
+            "file": path,
+            "old_host": old_host,
+            "old_port": old_port,
+            "new_host": new_host,
+            "new_port": new_port
+        }
+    except Exception as e:
+        return {"file": path, "error": f"write error: {e}"}
+
+def bulk_update_remote(new_host: str, new_port: Optional[int],
+                       keys_dir=KEYS_DIR,
+                       template_path=f"{OPENVPN_DIR}/client-template.txt"):
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    results = []
+    for fname in os.listdir(keys_dir):
+        if fname.endswith(".ovpn"):
+            full = os.path.join(keys_dir, fname)
+            r = update_remote_in_file(full, new_host, new_port, ts)
+            if r:
+                results.append(r)
+    if os.path.exists(template_path):
+        r = update_remote_in_file(template_path, new_host, new_port, ts)
+        if r:
+            results.append(r)
+    return results
+
+async def send_updated_ovpn_files(chat_id: int, bot, files: List[str]):
+    """Отправка всех обновлённых .ovpn файлов (простая задержка против rate limit)."""
+    import asyncio
+    sent = 0
+    for path in files:
+        if not path.endswith(".ovpn"):
+            continue
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=InputFile(f),
+                        filename=os.path.basename(path)
+                    )
+                sent += 1
+                await asyncio.sleep(0.3)  # микропаузa
+            except Exception as e:
+                print(f"[remote_send_all] error sending {path}: {e}")
+    return sent
+
+async def start_update_remote_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Кнопка "🌐 Обновить адрес"
+    q = update.callback_query
+    await q.answer()
+    context.user_data['await_new_remote'] = True
+    await q.edit_message_text(
+        "Введите новый адрес или домен (опционально :порт).\n"
+        "Примеры:\n"
+        "  203.0.113.55\n"
+        "  vpn.example.com:443\n"
+        "Если порт не указан — будет сохранён существующий в каждой конфигурации.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="cancel_update_remote")]])
+    )
+
+async def cancel_update_remote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('await_new_remote', None)
+    await update.callback_query.edit_message_text("Отменено.", reply_markup=get_main_keyboard())
+
+async def process_new_remote_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    host, port = parse_new_remote(raw)
+    if not host:
+        await update.message.reply_text("Пустой ввод. Попробуйте снова или нажмите меню.", reply_markup=get_main_keyboard())
+        context.user_data.pop('await_new_remote', None)
+        return
+
+    results = bulk_update_remote(host, port)
+    context.user_data.pop('await_new_remote', None)
+
+    if not results:
+        await update.message.reply_text("Не найдено ни одной строки remote для обновления.", reply_markup=get_main_keyboard())
+        return
+
+    updated = [r for r in results if 'error' not in r]
+    errors = [r for r in results if 'error' in r]
+
+    # Список обновлённых .ovpn (для последующей массовой отправки)
+    updated_ovpn_files = [r['file'] for r in updated if r['file'].endswith(".ovpn")]
+    context.user_data['updated_remote_files'] = updated_ovpn_files
+
+    lines = [
+        f"<b>Новый remote:</b> <code>{host}{':' + str(port) if port else ''}</code>",
+        f"Изменено файлов: {len(updated)}"
+    ]
+    sample = 0
+    for r in updated:
+        if sample < 5:
+            oldp = f":{r['old_port']}" if r['old_port'] else ""
+            newp = f":{r['new_port']}" if r['new_port'] else (f":{r['old_port']}" if r['old_port'] else "")
+            lines.append(f"• {os.path.basename(r['file'])}: {r['old_host']}{oldp} -> {r['new_host']}{newp}")
+            sample += 1
+    if len(updated) > sample:
+        lines.append(f"... ещё {len(updated)-sample} файлов")
+
+    if errors:
+        lines.append("\nОшибки:")
+        for e in errors[:3]:
+            lines.append(f"• {os.path.basename(e['file'])}: {e['error']}")
+        if len(errors) > 3:
+            lines.append(f"... ещё {len(errors)-3} ошибок")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Отправить все ключи", callback_data="remote_send_all")],
+        [InlineKeyboardButton("❌ Не отправлять", callback_data="remote_send_cancel")],
+    ])
+
+    await update.message.reply_text(
+        "\n".join(lines) + "\n\nОтправить все обновлённые .ovpn файлы сюда?",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+### REMOTE UPDATE END
+# ================== UI / HELP ==================
+
+HELP_TEXT = f"""
+<b>📖 Помощь по VPN Боту (версия {BOT_VERSION}):</b>
+
+Функции:
+• Статистика / Онлайн / Лог
+• Создание, обновление, удаление ключей
+• Включение / отключение клиента (CCD)
+• Бэкап / восстановление
+• Тревога по количеству онлайн
+• Накопительный трафик (📶 Трафик / /traffic)
+• Очистка трафика (🧹 Очистить трафик)
+• Массовое обновление remote адреса (🌐 Обновить адрес)
+• Вывод команд обновления (🔗 Обновление / /show_update_cmd)
+
+Все команды доступны только администратору.
+"""
 
 def get_main_keyboard():
     keyboard = [
         [InlineKeyboardButton("🔄 Список клиентов", callback_data='refresh')],
         [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
          InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
+        [InlineKeyboardButton("📶 Трафик", callback_data='traffic'),
+         InlineKeyboardButton("🔗 Обновление", callback_data='update_info')],
+        [InlineKeyboardButton("🧹 Очистить трафик", callback_data='traffic_clear'),
+         InlineKeyboardButton("🌐 Обновить адрес", callback_data='update_remote')],
         [InlineKeyboardButton("⏳ Сроки ключей", callback_data='keys_expiry'),
          InlineKeyboardButton("⌛ Обновить ключ", callback_data='renew_key')],
         [InlineKeyboardButton("✅ Вкл.клиента", callback_data='enable'),
@@ -236,8 +642,6 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
-        # Новая кнопка с командой обновления
-        [InlineKeyboardButton("🔗 Обновление", callback_data='update_info')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
@@ -258,54 +662,12 @@ def get_delete_keys_keyboard(keys):
     return InlineKeyboardMarkup(keyboard)
 
 def get_confirm_delete_keyboard(fname):
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{fname}")],
         [InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_delete")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
-HELP_TEXT = """
-<b>📖 Помощь по VPN Боту:</b>
-...
-"""
-
-# ================== UPDATE COMMAND FEATURE ==================
-
-def build_update_commands():
-    short_cmd = f"curl -L -o /root/monitor_bot/openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && systemctl restart vpn_bot.service"
-    safe_cmd = (
-        "cd /root/monitor_bot && "
-        "cp openvpn_monitor_bot.py openvpn_monitor_bot.py.bak_$(date +%Y%m%d_%H%M%S) && "
-        f"curl -L -o openvpn_monitor_bot.py {UPDATE_SOURCE_URL} && "
-        "python3 -m py_compile openvpn_monitor_bot.py && "
-        "systemctl restart vpn_bot.service"
-    )
-    return short_cmd, safe_cmd
-
-async def show_update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    short_cmd, safe_cmd = build_update_commands()
-    text = (
-        f"<b>Команда обновления бота</b> (версия: <code>{BOT_VERSION}</code>)\n\n"
-        "Простая:\n<code>" + short_cmd + "</code>\n\n"
-        "С бэкапом и проверкой:\n<code>" + safe_cmd + "</code>\n\n"
-        "Откат (пример):\n<code>cp /root/monitor_bot/openvpn_monitor_bot.py.bak_YYYYMMDD_HHMMSS "
-        " /root/monitor_bot/openvpn_monitor_bot.py && systemctl restart vpn_bot.service</code>"
-    )
-    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
-
-async def send_update_cmd_via_button(chat_id: int, bot):
-    short_cmd, safe_cmd = build_update_commands()
-    text = (
-        f"<b>Обновление бота</b>\nТекущая версия: <code>{BOT_VERSION}</code>\n\n"
-        "Простая:\n<code>" + short_cmd + "</code>\n\n"
-        "Расширенная (с бэкапом):\n<code>" + safe_cmd + "</code>"
-    )
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-
-# ================== OVPN ГЕНЕРАЦИЯ / КЛЮЧИ ==================
+# ================== Генерация OVPN / Ключи ==================
 
 def generate_ovpn_for_client(
     client_name,
@@ -362,7 +724,7 @@ def generate_ovpn_for_client(
         f.write(ovpn_content)
     return ovpn_file
 
-# === (остальные хендлеры создания/обновления/удаления ключей без изменений) ===
+# --- Create / Renew key handlers (без изменений) ---
 
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('await_key_name'):
@@ -396,8 +758,7 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         except subprocess.CalledProcessError as e:
             await update.message.reply_text(f"Ошибка генерации сертификата: {e}", parse_mode="HTML")
-            context.user_data.pop('new_key_name', None)
-            context.user_data.pop('new_key_expiry', None)
+            context.user_data.clear()
             return
 
         ovpn_path = generate_ovpn_for_client(key_name)
@@ -411,8 +772,7 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 document=InputFile(f),
                 filename=f"{key_name}.ovpn"
             )
-        context.user_data.pop('new_key_name', None)
-        context.user_data.pop('new_key_expiry', None)
+        context.user_data.clear()
         return
 
 async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,9 +808,8 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
     key_path = f"{EASYRSA_DIR}/pki/private/{key_name}.key"
     req_path = f"{EASYRSA_DIR}/pki/reqs/{key_name}.req"
     if not os.path.exists(cert_path):
-        await update.message.reply_text("Сертификат не найден для обновления!")
-        context.user_data.pop('renew_key_name', None)
-        context.user_data.pop('await_renew_expiry', None)
+        await update.message.reply_text("Сертификат не найден!")
+        context.user_data.clear()
         return
     try:
         days_to_add = int(update.message.text.strip())
@@ -461,15 +820,14 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
     with open(cert_path, "rb") as f:
         cert_data = f.read()
         cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
-        not_after = cert.get_notAfter().decode("ascii")
-        expiry_date = datetime.strptime(not_after, "%Y%m%d%H%M%SZ")
+        expiry_old = datetime.strptime(cert.get_notAfter().decode("ascii"), "%Y%m%d%H%M%SZ")
 
-    new_expiry_date = expiry_date + timedelta(days=days_to_add)
+    new_expiry_date = expiry_old + timedelta(days=days_to_add)
     total_days = (new_expiry_date - datetime.utcnow()).days
 
-    for path in [cert_path, key_path, req_path]:
-        if os.path.exists(path):
-            os.remove(path)
+    for p in [cert_path, key_path, req_path]:
+        if os.path.exists(p):
+            os.remove(p)
 
     try:
         subprocess.run(
@@ -477,14 +835,13 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
             shell=True, check=True, cwd=EASYRSA_DIR
         )
     except subprocess.CalledProcessError as e:
-        await update.message.reply_text(f"Ошибка обновления сертификата: {e}", parse_mode="HTML")
-        context.user_data.pop('renew_key_name', None)
-        context.user_data.pop('await_renew_expiry', None)
+        await update.message.reply_text(f"Ошибка обновления: {e}", parse_mode="HTML")
+        context.user_data.clear()
         return
 
     ovpn_path = generate_ovpn_for_client(key_name)
     await update.message.reply_text(
-        f"Ключ <b>{key_name}</b> обновлён!\nНовый срок действия: {total_days} дней.\nФайл: {ovpn_path}",
+        f"Ключ <b>{key_name}</b> обновлён!\nНовый срок: {total_days} дней.\nФайл: {ovpn_path}",
         parse_mode="HTML"
     )
     with open(ovpn_path, "rb") as f:
@@ -493,10 +850,9 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
             document=InputFile(f),
             filename=f"{key_name}.ovpn"
         )
-    context.user_data.pop('renew_key_name', None)
-    context.user_data.pop('await_renew_expiry', None)
+    context.user_data.clear()
 
-# ================== ПРОЧЕЕ (лог, бэкап и т.д.) ==================
+# ================== Прочее (лог, бэкап, восстановление) ==================
 
 def get_status_log_tail(n=40):
     try:
@@ -523,36 +879,78 @@ async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=os.path.basename(backup_file)
         )
 
-# ================== УВЕДОМЛЕНИЯ ==================
+async def restore_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("Отправьте архив (.tar.gz) сюда.")
+    context.user_data['restore_wait_file'] = True
 
-def is_notify_enabled():
-    return os.path.exists(NOTIFY_FILE)
-
-def set_notify(flag):
-    if flag:
-        os.makedirs(os.path.dirname(NOTIFY_FILE), exist_ok=True)
-        with open(NOTIFY_FILE, "w") as f:
-            f.write("on")
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    if context.user_data.get('restore_wait_file'):
+        file = update.message.document
+        if file and (
+            file.mime_type in ['application/gzip', 'application/x-gzip', 'application/x-tar', 'application/octet-stream']
+            or file.file_name.endswith(('.tar.gz', '.tgz', '.tar'))
+        ):
+            file_id = file.file_id
+            file_name = file.file_name
+            new_path = f"/root/{file_name}"
+            new_file = await context.bot.get_file(file_id)
+            await new_file.download_to_drive(new_path)
+            context.user_data['restore_wait_file'] = False
+            context.user_data['restore_file_path'] = new_path
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да, восстановить", callback_data='restore_confirm')],
+                [InlineKeyboardButton("❌ Нет, отменить", callback_data='restore_cancel')],
+            ])
+            await update.message.reply_text(
+                f"Файл получен: <code>{file_name}</code>\nВосстановить?",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+        else:
+            await update.message.reply_text("Нужен архив .tar.gz")
     else:
-        if os.path.exists(NOTIFY_FILE):
-            os.remove(NOTIFY_FILE)
+        await update.message.reply_text("Сначала нажмите 'Восстан.бэкап' в меню.")
 
-async def notify_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    enabled = is_notify_enabled()
-    set_notify(not enabled)
-    if not enabled:
-        await query.edit_message_text("✅ Уведомления о новых подключениях ВКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+async def restore_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file_path = context.user_data.get('restore_file_path')
+    if file_path and os.path.exists(file_path):
+        subprocess.run(f"tar -xzvf {file_path} -C /", shell=True)
+        await update.callback_query.answer("Готово!")
+        await update.callback_query.edit_message_text("✅ Восстановлено.", reply_markup=get_main_keyboard())
+        context.user_data['restore_file_path'] = None
     else:
-        await query.edit_message_text("🚫 Уведомления о новых подключениях ВЫКЛЮЧЕНЫ.", reply_markup=get_main_keyboard())
+        await update.callback_query.answer("Файл не найден!", show_alert=True)
+        await update.callback_query.edit_message_text("❌ Ошибка: файл не найден.", reply_markup=get_main_keyboard())
 
-# Главный мониторинг
+async def restore_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['restore_file_path'] = None
+    await update.callback_query.answer("Отменено.")
+    await update.callback_query.edit_message_text("Восстановление отменено.", reply_markup=get_main_keyboard())
+
+# ================== Трафик хендлеры ==================
+
+async def traffic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    save_traffic_db(force=True)
+    report = build_traffic_report()
+    await update.message.reply_text(report, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+# ================== Мониторинг (цикл) ==================
+
 async def check_new_connections(app: Application):
     global clients_last_online, last_alert_time
     import asyncio
     while True:
         try:
             clients, online_names, tunnel_ips = parse_openvpn_status()
+            update_traffic_from_status(clients)
+
             online_count = len(online_names)
             total_keys = len(get_ovpn_files())
             now = time.time()
@@ -561,7 +959,7 @@ async def check_new_connections(app: Application):
                 if now - last_alert_time > ALERT_INTERVAL_SEC:
                     await app.bot.send_message(
                         chat_id=ADMIN_ID,
-                        text="❌ Все клиенты оффлайн! Возможна блокировка IP сервера или падение OpenVPN.",
+                        text="❌ Все клиенты оффлайн! Возможна блокировка IP или падение OpenVPN.",
                         parse_mode="HTML"
                     )
                     last_alert_time = now
@@ -569,7 +967,7 @@ async def check_new_connections(app: Application):
                 if now - last_alert_time > ALERT_INTERVAL_SEC:
                     await app.bot.send_message(
                         chat_id=ADMIN_ID,
-                        text=f"⚠️ Онлайн мало: {online_count} из {total_keys}. Возможные проблемы (блокировка / сеть).",
+                        text=f"⚠️ Онлайн мало: {online_count} из {total_keys}.",
                         parse_mode="HTML"
                     )
                     last_alert_time = now
@@ -583,7 +981,7 @@ async def check_new_connections(app: Application):
             print(f"[check_new_connections] Ошибка цикла: {e}")
             await asyncio.sleep(10)
 
-# ================== ХЕНДЛЕРЫ TELEGRAM ==================
+# ================== Прочие хендлеры ==================
 
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -593,6 +991,8 @@ async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_T
         await create_key_handler(update, context)
     elif context.user_data.get('await_renew_expiry'):
         await renew_key_expiry_handler(update, context)
+    elif context.user_data.get('await_new_remote'):
+        await process_new_remote_input(update, context)
     else:
         await update.message.reply_text("Неизвестный ввод. Используй меню.", reply_markup=get_main_keyboard())
 
@@ -636,20 +1036,20 @@ async def disable_client_handler(update: Update, context: ContextTypes.DEFAULT_T
     block_client_ccd(cname)
     killed = kill_openvpn_session(cname)
     msg = f"Клиент <b>{cname}</b> отключён."
-    msg += "\nСессия завершена." if killed else "\nАктивная сессия (если была) завершится при переподключении."
+    msg += "\nСессия завершена." if killed else "\nАктивная сессия завершится при переподключении."
     await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Доступ запрещён.")
         return
-    await update.message.reply_text(f"Добро пожаловать в VPN бот!\nВерсия: <code>{BOT_VERSION}</code>", parse_mode="HTML", reply_markup=get_main_keyboard())
+    await update.message.reply_text(f"Добро пожаловать в VPN бот! Версия: {BOT_VERSION}", reply_markup=get_main_keyboard())
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Доступ запрещён.")
         return
-    await update.message.reply_text(HELP_TEXT.replace("...", f"(версия {BOT_VERSION})"), parse_mode="HTML", reply_markup=get_main_keyboard())
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -682,7 +1082,6 @@ async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступ запрещён.")
         return
     clients, online_names, tunnel_ips = parse_openvpn_status()
-    # Формируем только онлайн
     res = []
     for c in clients:
         if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
@@ -690,7 +1089,7 @@ async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res.append(
                 f"🟢 <b>{c['name']}</b>\n"
                 f"🌐 <code>{c.get('ip','нет')}</code>\n"
-                f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
+                f"🛡️ Tunnel: <code>{tunnel_ip}</code>\n"
                 f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
                 f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
                 + "-"*15
@@ -776,59 +1175,22 @@ async def delete_key_confirm_handler(update: Update, context: ContextTypes.DEFAU
 async def delete_key_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("Удаление отменено.", reply_markup=get_main_keyboard())
 
-async def restore_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.edit_message_text("Отправьте архив (.tar.gz) сюда.")
-    context.user_data['restore_wait_file'] = True
+# ================== Button Handler ==================
 
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    if context.user_data.get('restore_wait_file'):
-        file = update.message.document
-        if file and (
-            file.mime_type in ['application/gzip', 'application/x-gzip', 'application/x-tar', 'application/octet-stream']
-            or file.file_name.endswith(('.tar.gz', '.tgz', '.tar'))
-        ):
-            file_id = file.file_id
-            file_name = file.file_name
-            new_path = f"/root/{file_name}"
-            new_file = await context.bot.get_file(file_id)
-            await new_file.download_to_drive(new_path)
-            context.user_data['restore_wait_file'] = False
-            context.user_data['restore_file_path'] = new_path
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Да, восстановить", callback_data='restore_confirm')],
-                [InlineKeyboardButton("❌ Нет, отменить", callback_data='restore_cancel')],
-            ])
-            await update.message.reply_text(
-                f"Файл получен: <code>{file_name}</code>\nВосстановить?",
-                parse_mode="HTML",
-                reply_markup=kb
+def format_online_clients(clients, online_names, tunnel_ips):
+    res = []
+    for c in clients:
+        if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
+            tunnel_ip = tunnel_ips.get(c['name'], 'нет')
+            res.append(
+                f"🟢 <b>{c['name']}</b>\n"
+                f"🌐 <code>{c.get('ip','нет')}</code>\n"
+                f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
+                f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
+                f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
+                + "-"*15
             )
-        else:
-            await update.message.reply_text("Нужен архив .tar.gz")
-    else:
-        await update.message.reply_text("Сначала нажмите 'Восстан.бэкап' в меню.")
-
-async def restore_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file_path = context.user_data.get('restore_file_path')
-    if file_path and os.path.exists(file_path):
-        subprocess.run(f"tar -xzvf {file_path} -C /", shell=True)
-        await update.callback_query.answer("Готово!")
-        await update.callback_query.edit_message_text("✅ Восстановлено.", reply_markup=get_main_keyboard())
-        context.user_data['restore_file_path'] = None
-    else:
-        await update.callback_query.answer("Файл не найден!", show_alert=True)
-        await update.callback_query.edit_message_text("❌ Ошибка: файл не найден.", reply_markup=get_main_keyboard())
-
-async def restore_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['restore_file_path'] = None
-    await update.callback_query.answer("Отменено.")
-    await update.callback_query.edit_message_text("Восстановление отменено.", reply_markup=get_main_keyboard())
-
-# ================== BUTTON HANDLER ==================
+    return "<b>Онлайн клиенты:</b>\n\n" + ("\n".join(res) if res else "Нет активных клиентов.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -841,10 +1203,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'refresh':
         msg = format_clients_by_certs()
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+
     elif data == 'renew_key':
         await renew_key_request(update, context)
     elif data.startswith('renew_'):
         await renew_key_select_handler(update, context)
+
     elif data == 'stats':
         clients, online_names, tunnel_ips = parse_openvpn_status()
         ipp_map = read_ipp_file("/etc/openvpn/ipp.txt")
@@ -853,6 +1217,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for msg in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+
     elif data == 'online':
         clients, online_names, tunnel_ips = parse_openvpn_status()
         text = format_online_clients(clients, online_names, tunnel_ips)
@@ -860,60 +1225,119 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for m in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=m, parse_mode="HTML")
+
+    elif data == 'traffic':
+        save_traffic_db(force=True)
+        report = build_traffic_report()
+        await query.edit_message_text(report, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+    elif data == 'traffic_clear':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, очистить", callback_data="confirm_clear_traffic")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_clear_traffic")],
+        ])
+        await query.edit_message_text(
+            "Очистить накопленный трафик? Будет создан бэкап файла traffic_usage.json.*",
+            reply_markup=kb
+        )
+    elif data == 'confirm_clear_traffic':
+        clear_traffic_stats()
+        await query.edit_message_text("✅ Трафик очищен.", reply_markup=get_main_keyboard())
+    elif data == 'cancel_clear_traffic':
+        await query.edit_message_text("Отменено. Трафик не изменён.", reply_markup=get_main_keyboard())
+
+    elif data == 'update_remote':
+        await start_update_remote_flow(update, context)
+    elif data == 'cancel_update_remote':
+        await cancel_update_remote(update, context)
+
+    elif data == 'remote_send_all':
+        files = context.user_data.pop('updated_remote_files', [])
+        if not files:
+            await query.edit_message_text("Список обновлённых файлов пуст или уже отправлен.", reply_markup=get_main_keyboard())
+            return
+        await query.edit_message_text("Отправляю ключи...", reply_markup=get_main_keyboard())
+        sent = await send_updated_ovpn_files(update.effective_chat.id, context.bot, files)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Отправлено файлов: {sent}",
+            reply_markup=get_main_keyboard()
+        )
+
+    elif data == 'remote_send_cancel':
+        context.user_data.pop('updated_remote_files', None)
+        await query.edit_message_text("Отправка отменена.", reply_markup=get_main_keyboard())
+
+    elif data == 'update_info':
+        await send_update_cmd_via_button(update.effective_chat.id, context.bot)
+
     elif data == 'keys_expiry':
         await view_keys_expiry_handler(update, context)
+
     elif data == 'help':
-        msgs = split_message(HELP_TEXT.replace("...", f"(версия {BOT_VERSION})"))
+        msgs = split_message(HELP_TEXT)
         await query.edit_message_text(msgs[0], parse_mode="HTML", reply_markup=get_main_keyboard())
         for m in msgs[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=m, parse_mode="HTML")
+
     elif data == 'restore_confirm':
         await restore_confirm_handler(update, context)
     elif data == 'restore_cancel':
         await restore_cancel_handler(update, context)
+
     elif data == 'send_keys':
         keys = get_ovpn_files()
         await query.edit_message_text("Выберите ключ:", reply_markup=get_keys_keyboard(keys))
+
     elif data.startswith('key_'):
         idx = int(data.split('_')[1]) - 1
         keys = get_ovpn_files()
         if 0 <= idx < len(keys):
             await send_ovpn_file(update, context, keys[idx])
+
     elif data == 'delete_key':
         await delete_key_request(update, context)
+
     elif data.startswith('delete_'):
         await delete_key_select_handler(update, context)
+
     elif data.startswith('confirm_delete_'):
         await delete_key_confirm_handler(update, context)
+
     elif data == 'cancel_delete':
         await delete_key_cancel_handler(update, context)
+
     elif data == 'create_key':
         await ask_key_name(update, context)
+
     elif data == 'backup':
         await send_backup(update, context)
+
     elif data == 'restore':
         await restore_request(update, context)
+
     elif data == 'home':
         await query.edit_message_text("Добро пожаловать в VPN бот!", reply_markup=get_main_keyboard())
+
     elif data == 'enable':
         await enable_request(update, context)
     elif data.startswith('enable_'):
         await enable_client_handler(update, context)
+
     elif data == 'disable':
         await disable_request(update, context)
     elif data.startswith('disable_'):
         await disable_client_handler(update, context)
+
     elif data == 'log':
         await log_request(update, context)
+
     elif data == 'block_alert':
         await query.edit_message_text(
             "Тревога активна в фоне.\n"
-            f"Порог: < {MIN_ONLINE_ALERT} / интервал антиспама: {ALERT_INTERVAL_SEC}s.\n"
-            "Изменить можно в коде.",
+            f"Порог: < {MIN_ONLINE_ALERT}, антиспам: {ALERT_INTERVAL_SEC}s.",
             reply_markup=get_main_keyboard()
         )
-    elif data == 'update_info':
-        await send_update_cmd_via_button(update.effective_chat.id, context.bot)
     else:
         await query.edit_message_text("Команда не реализована.", reply_markup=get_main_keyboard())
 
@@ -922,20 +1346,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    load_traffic_db()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clients", clients_command))
     app.add_handler(CommandHandler("online", online_command))
-    app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))   # новая команда
+    app.add_handler(CommandHandler("traffic", traffic_command))
+    app.add_handler(CommandHandler("show_update_cmd", show_update_cmd))
+    # Можно добавить отдельную команду для remote позже
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_text_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-
     app.add_handler(CallbackQueryHandler(button_handler))
 
     import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
+
     app.run_polling()
 
 if __name__ == '__main__':
