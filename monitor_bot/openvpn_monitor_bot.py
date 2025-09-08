@@ -324,18 +324,13 @@ def build_traffic_report():
         key=lambda x: (x[1]['rx'] + x[1]['tx']) if isinstance(x[1], dict) else x[1],
         reverse=True
     )
-    lines = ["<b>Использование трафика:</b>"]
+    lines = ["<b>Использование трафика (суммарно):</b>"]
     for name, val in items:
         if isinstance(val, dict):
-            rx = val.get('rx', 0)
-            tx = val.get('tx', 0)
-            total = rx + tx
-            lines.append(
-                f"• <b>{name}</b>: {RX_ARROW}{ARROWS_SPACING}{format_gb(rx)} "
-                f"{TX_ARROW}{ARROWS_SPACING}{format_gb(tx)} (= --{format_gb(total)}--)"
-            )
+            total = val.get('rx', 0) + val.get('tx', 0)
+            lines.append(f"• <b>{name}</b>: --{format_gb(total)}--")
         else:
-            lines.append(f"• <b>{name}</b>: Σ --{format_gb(val)}--")
+            lines.append(f"• <b>{name}</b>: --{format_gb(val)}--")
     return "\n".join(lines)
 
 def update_traffic_from_status(clients):
@@ -606,18 +601,33 @@ async def process_new_remote_input(update: Update, context: ContextTypes.DEFAULT
 # ================== UI / HELP ==================
 
 HELP_TEXT = f"""
-<b>📖 Помощь по VPN Боту (версия {BOT_VERSION}):</b>
+<b>📖 Помощь по VPN Боту (версия {BOT_VERSION})</b>
 
-Функции:
-• Статистика / Онлайн / Лог
+<b>Основные функции:</b>
+• Статистика всех ключей (алфавитно)
+• Онлайн клиенты (алфавитно)
+• Просмотр трафика (только общий объём)
 • Создание, обновление, удаление ключей
-• Включение / отключение клиента (CCD)
-• Бэкап / восстановление
-• Тревога по количеству онлайн
-• Накопительный трафик (📶 Трафик / /traffic)
-• Очистка трафика (🧹 Очистить трафик)
-• Массовое обновление remote адреса (🌐 Обновить адрес)
-• Вывод команд обновления (🔗 Обновление / /show_update_cmd)
+• Включение/отключение клиента (CCD)
+• Массовое обновление remote-адреса в ключах
+• Бэкап и восстановление OpenVPN
+• Просмотр сроков действия сертификатов
+• Отправка ipp.txt (🛣️ Тунель)
+• Просмотр status.log
+
+<b>Обновление бота:</b>
+• Кнопка «🔗 Обновление» — команды для автообновления скрипта (с бэкапом и откатом).
+• Для отката используйте .bak-файлы, пример команды есть в подсказке обновления.
+
+<b>Последний фикс:</b>
+• <code>2025-09-08</code>
+    – Сортировка по алфавиту в «Удалить ключ» и «Онлайн клиенты»
+    – В трафике показывается только общий объем
+    – Добавлена кнопка 🛣️ для отправки ipp.txt
+    – Исправлены мелкие баги
+
+<b>Контакт для связи/поддержки:</b>
+• <a href="https://t.me/XSFORM">@XSFORM</a>
 
 Все команды доступны только администратору.
 """
@@ -642,6 +652,7 @@ def get_main_keyboard():
         [InlineKeyboardButton("📦 Бэкап OpenVPN", callback_data='backup'),
          InlineKeyboardButton("🔄 Восстан.бэкап", callback_data='restore')],
         [InlineKeyboardButton("🚨 Тревога блокировки", callback_data='block_alert')],
+        [InlineKeyboardButton("🛣️ Тунель", callback_data='send_ipp')],
         [InlineKeyboardButton("❓ Помощь", callback_data='help'),
          InlineKeyboardButton("🏠 В главное меню", callback_data='home')],
     ]
@@ -649,14 +660,14 @@ def get_main_keyboard():
 
 def get_keys_keyboard(keys):
     keyboard = []
-    for i, fname in enumerate(keys, 1):
+    for i, fname in enumerate(sorted(keys), 1):
         keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"key_{i}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
     return InlineKeyboardMarkup(keyboard)
 
 def get_delete_keys_keyboard(keys):
     keyboard = []
-    for i, fname in enumerate(keys, 1):
+    for i, fname in enumerate(sorted(keys), 1):
         keyboard.append([InlineKeyboardButton(f"{i}. {fname}", callback_data=f"delete_{fname}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
     return InlineKeyboardMarkup(keyboard)
@@ -781,7 +792,7 @@ async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("Нет ключей для обновления.", reply_markup=get_main_keyboard())
         return
     keyboard = []
-    for i, fname in enumerate(keys, 1):
+    for i, fname in enumerate(sorted(keys), 1):
         keyboard.append([InlineKeyboardButton(f"{i}. {fname[:-5]}", callback_data=f"renew_{fname}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='home')])
     await update.callback_query.edit_message_text(
@@ -1178,18 +1189,23 @@ async def delete_key_cancel_handler(update: Update, context: ContextTypes.DEFAUL
 # ================== Button Handler ==================
 
 def format_online_clients(clients, online_names, tunnel_ips):
+    # Фильтруем только онлайн и не заблокированных, затем сортируем по имени
+    filtered = [
+        c for c in clients
+        if c['name'] in online_names and not is_client_ccd_disabled(c['name'])
+    ]
+    filtered_sorted = sorted(filtered, key=lambda c: c['name'].lower())
     res = []
-    for c in clients:
-        if c['name'] in online_names and not is_client_ccd_disabled(c['name']):
-            tunnel_ip = tunnel_ips.get(c['name'], 'нет')
-            res.append(
-                f"🟢 <b>{c['name']}</b>\n"
-                f"🌐 <code>{c.get('ip','нет')}</code>\n"
-                f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
-                f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
-                f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
-                + "-"*15
-            )
+    for c in filtered_sorted:
+        tunnel_ip = tunnel_ips.get(c['name'], 'нет')
+        res.append(
+            f"🟢 <b>{c['name']}</b>\n"
+            f"🌐 <code>{c.get('ip','нет')}</code>\n"
+            f"🛡️ <b>Tunnel:</b> <code>{tunnel_ip}</code>\n"
+            f"📥 {bytes_to_mb(c.get('bytes_recv',0))} | 📤 {bytes_to_mb(c.get('bytes_sent',0))}\n"
+            f"🕒 {format_tm_time(c.get('connected_since',''))}\n"
+            + "-"*15
+        )
     return "<b>Онлайн клиенты:</b>\n\n" + ("\n".join(res) if res else "Нет активных клиентов.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1273,6 +1289,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == 'keys_expiry':
         await view_keys_expiry_handler(update, context)
+        
+    elif data == 'send_ipp':
+        ipp_path = "/etc/openvpn/ipp.txt"
+        if os.path.exists(ipp_path):
+            with open(ipp_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=InputFile(f),
+                    filename="ipp.txt"
+                )
+            await query.edit_message_text("Файл ipp.txt отправлен.", reply_markup=get_main_keyboard())
+        else:
+            await query.edit_message_text("Файл ipp.txt не найден.", reply_markup=get_main_keyboard())    
 
     elif data == 'help':
         msgs = split_message(HELP_TEXT)
