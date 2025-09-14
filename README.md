@@ -32,8 +32,7 @@
 
 5. **После завершения установки ОБЯЗАТЕЛЬНО перезапустите терминал.**
 
-   
----
+   ---
 
 ## Автоустановка
 
@@ -46,6 +45,8 @@
    ```bash
    sudo sh -c 'apt update && apt install -y git && git clone https://github.com/XSFORM/OpenVpn-scramble-xormask.git && cd OpenVpn-scramble-xormask && chmod +x install.sh install_openvpn_xormask.sh && ./install.sh'
    ```
+
+3. **После завершения установки ОБЯЗАТЕЛЬНО перезапустите терминал.**
 
 ---
 
