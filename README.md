@@ -97,4 +97,4 @@
 ## Автор
 
 XSFORM  
-Telegram: [@XSFORM](https://t.me/XSFORM)
+Telegram: [@XSFORM](https://t.me/XS_FORM)
