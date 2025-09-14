@@ -35,6 +35,21 @@
    
 ---
 
+## Автоустановка
+
+1. **Если root:**
+   ```bash
+   apt update && apt install -y git && git clone https://github.com/XSFORM/OpenVpn-scramble-xormask.git && cd OpenVpn-scramble-xormask && chmod +x install.sh install_openvpn_xormask.sh && ./install.sh
+   ```
+
+2. **Если sudo:**
+   ```bash
+   sudo sh -c 'apt update && apt install -y git && git clone https://github.com/XSFORM/OpenVpn-scramble-xormask.git && cd OpenVpn-scramble-xormask && chmod +x install.sh install_openvpn_xormask.sh && ./install.sh'
+   ```
+
+---
+
+
 ## Управление OpenVPN
 
 1. **Дайте права на запуск:**
