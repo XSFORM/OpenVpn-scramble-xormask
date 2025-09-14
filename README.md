@@ -55,8 +55,8 @@
 - Бот запускается как systemd-сервис и работает автоматически.
 - Для управления сервисом:
   ```bash
-  systemctl status vpn_bot.service
   systemctl restart vpn_bot.service
+  systemctl status vpn_bot.service
   ```
 
 ---
