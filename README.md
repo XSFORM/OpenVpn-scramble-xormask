@@ -83,6 +83,12 @@
   ```bash
   sudo systemctl restart openvpn@server
 
+---
+
+- Статус openvpn
+  ```bash
+  sudo systemctl status openvpn@server
+
 - Ваши токены и ID хранятся только в `/root/monitor_bot/config.py` и не попадают в репозиторий.
 - Для обновления — просто скачайте новую версию репозитория, повторите установку, ваши ключи сохранятся.
 
