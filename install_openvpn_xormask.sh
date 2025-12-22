@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "[*] Устанавливаем обычный OpenVPN ..."
-wget -q https://git.io/v1jlQ -O openvpn-install.sh && bash openvpn-install.sh
+wget -q https://raw.githubusercontent.com/XSFORM/OpenVpn-scramble-xormask/main/openvpn-install.sh -O openvpn-install.sh && bash openvpn-install.sh
 
 echo "[*] Удаляем обычный OpenVPN ..."
 apt remove openvpn -y
